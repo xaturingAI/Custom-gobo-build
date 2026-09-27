@@ -1,0 +1,131 @@
+diff --git a/bin/GoboLinuxInstaller b/bin/GoboLinuxInstaller
+index 1aa8bc3..f7ff827 100755
+--- a/bin/GoboLinuxInstaller
++++ b/bin/GoboLinuxInstaller
+@@ -161,6 +161,11 @@ class DiskUtility :
+ 		elif fileSystem == 'XFS' :
+ 			cmd = 'mkfs.xfs -f -q /dev/%s'%partition
+ 
++		elif fileSystem == 'ZFS' :
++			# ZFS root: a single-disk vdev pool named rpool. The pool and its
++			# root dataset are then mounted at the install target by mount().
++			cmd = 'zpool create -f -o ashift=12 rpool /dev/%s' %partition
++
+ 		elif fileSystem == 'FAT32' :
+ 			cmd = 'mkfs.fat -F 32 /dev/%s'%partition
+ 
+@@ -169,7 +174,7 @@ class DiskUtility :
+ 			return
+ 
+ 		safeRun(cmd, '', 0, self.logger)
+-		if self.reallyInstall :
++		if self.reallyInstall and fileSystem != 'ZFS' :
+ 			self.__refreshUUID(partition)
+ 
+ 	def bindMountTable(self, dest):
+@@ -195,15 +200,25 @@ class DiskUtility :
+ 			cmd = 'umount --recursive %s' %dest
+ 			safeRun(cmd, 'Unbinding ' + src, 0, self.logger)
+ 
+-	def mount(self, partition, destMountPoint) :
++	def mount(self, partition, destMountPoint, fileSystem = '') :
+ 		if not os.path.exists(destMountPoint) :
+ 			os.makedirs(destMountPoint)
+-		cmd = 'mount /dev/%s %s'%(partition, destMountPoint)
++		if fileSystem == 'ZFS' :
++			# rpool was created by formatPartition. Point its root dataset at
++			# the install target so ProfileInstall can copy the system in.
++			cmd = 'zfs set mountpoint=%s rpool && zfs mount rpool' %destMountPoint
++		else :
++			cmd = 'mount /dev/%s %s'%(partition, destMountPoint)
+ 		safeRun(cmd, 'Mounting root partition', 0, self.logger)
+ 
+-	def unmount(self, partition, destMountPoint) :
++	def unmount(self, partition, destMountPoint, fileSystem = '') :
+ 		#log(tr('Unmounting selected root partition %s...' %partition))
+-		safeRun('umount ' + destMountPoint)
++		if fileSystem == 'ZFS' :
++			# Export the pool so it can be imported again on the installed box.
++			cmd = 'zfs set mountpoint=legacy rpool && zpool export rpool'
++		else :
++			cmd = 'umount ' + destMountPoint
++		safeRun(cmd)
+ 
+ 
+ class BootLoader :
+@@ -250,7 +265,7 @@ class BootLoader :
+ 
+ 	def installGrub(self) :
+ 		self.__fixDevRoot()
+-		grub_modules = 'normal part_gpt part_msdos multiboot biosdisk nativedisk fat'
++		grub_modules = 'normal part_gpt part_msdos multiboot biosdisk nativedisk fat zfs'
+ 		grub_cmd = 'grub-install --no-floppy --modules="%s" /dev/%s' %(grub_modules, self.targetDisc)
+ 		cmd = 'chroot %s %s' %(self.destMountPoint, grub_cmd)
+ 		safeRun(cmd, 'grub-install', 1, self.logger)
+@@ -288,3 +303,3 @@ class BootLoader :
+ 		cmd = 'grub-mkstandalone-efi -d /lib/grub/x86_64-efi -O x86_64-efi '
+-		cmd += '--modules="part_gpt part_msdos iso9660 all_video efi_gop efi_uga video_cirrus gfxterm gettext font" '
++		cmd += '--modules="part_gpt part_msdos iso9660 all_video efi_gop efi_uga video_cirrus gfxterm gettext font zfs" '
+ 		cmd += '--fonts="unicode" --themes="" -o %s --compress=gz ' %efiapp
+ 		grub_cmd += '--target=x86_64-efi '
+ 		grub_cmd += '--no-floppy '
+@@ -656,7 +671,7 @@ def deviceSelectionComplete() :
+ 	return showSelectedSetSize()
+ 
+ deviceSelection.addBoolean('DoFormat',   tr('Format partition'), 0, tr('Erase all contents of the partition and prepare it to receive the new system?'), doFormatChanged)
+-deviceSelection.addList('PartitionType', tr('File system'), (['Ext4'], 'Ext4'), tr('Which kind of file system should be used to format the root partition.') )
++deviceSelection.addList('PartitionType', tr('File system'), (['Ext4', 'XFS', 'ZFS'], 'Ext4'), tr('Which kind of file system should be used to format the root partition.') )
+ deviceSelection.setEnabled('PartitionType', 0)
+ deviceSelection.onValidate(deviceSelectionComplete)
+ 
+@@ -949,15 +964,16 @@ def _RunInstallation():
+ 	############################################################################
+ 	diskutil = DiskUtility(logger, reallyInstall)
+ 	rootPartition = rootPartitionName()
++	fileSystem = installer.getValue('PartitionType')[1]
+ 	uuidBeforeMkfs = diskutil.getFilesystemUUID(rootPartition)
+ 	if installer.getValue('DoFormat') :
+ 		log(tr('Formatting root partition %s...') %rootPartitionName_and_Size())
+-		diskutil.formatPartition(rootPartition, installer.getValue('PartitionType')[1])
++		diskutil.formatPartition(rootPartition, fileSystem)
+ 
+ 	############################################################################
+ 	# Mount partition
+ 	log(tr('Mounting selected root partition %s...')%rootPartition)
+-	diskutil.mount(rootPartition, destMountPoint)
++	diskutil.mount(rootPartition, destMountPoint, fileSystem)
+ 
+ 	############################################################################
+ 	# Check out dependencies
+@@ -1105,6 +1121,22 @@ def _RunInstallation():
+ 	cmd = 'GenFstab %s %s > %s/System/Settings/fstab'%(espParams, genFstabParams,destMountPoint)
+ 	safeRun(cmd, 'fstab generation', 0, logger)
+ 
++	if fileSystem == 'ZFS' :
++		# GenFstab guesses root's filesystem from the booted live device
++		# (auto), which is wrong for a ZFS root. Rewrite the root line so the
++		# installed system imports rpool at boot instead.
++		fstab_path = destMountPoint+'/System/Settings/fstab'
++		fstab_lines = safeFileReadLines(fstab_path, logger)
++		root_idx = None
++		for i, line in enumerate(fstab_lines) :
++			if line and line[0] != '#' and line.split() and line.split()[1] == '/' :
++				root_idx = i
++				break
++		zfs_root_line = 'rpool / zfs defaults 0 0'
++		if root_idx is not None :
++			fstab_lines[root_idx] = zfs_root_line
++			safeWriteToFile(fstab_path, "\n".join(fstab_lines)+"\n", logger)
++
+ 	lines = safeFileReadLines(destMountPoint+'/System/Settings/fstab', logger)
+ 	lines = [x for x in lines if x and x[0] != '#' and x.find('/Mount/') > -1]
+ 	mountList = [x.split()[1] for x in lines]
+@@ -1247,7 +1279,7 @@ def _RunInstallation():
+ 	############################################################################
+ 	# Unmounting mount point
+ 	diskutil.unmountPseudoFS(destMountPoint)
+-	diskutil.unmount(rootPartition, destMountPoint)
++	diskutil.unmount(rootPartition, destMountPoint, fileSystem)
+ 	
+ 	############################################################################
+ 	# Done message

@@ -1,0 +1,49 @@
+# GoboLinux Installer: ZFS swap zvol (apply AFTER goboLinuxInstaller-xfs-zfs.patch)
+# cd / && patch -p1 < gobo-installer-swap-zfs.patch
+--- a/Programs/Installer/017.01/bin/GoboLinuxInstaller
++++ b/Programs/Installer/017.01/bin/GoboLinuxInstaller
+@@ -1,4 +1,5 @@
+ #!/usr/bin/python3
++# gobo livefix 45: ZFS swap zvol support
+ # -*- coding: iso-8859-1 -*-
+ #
+ # *** GOBOLINUX GRAPHICAL/CONSOLE INSTALLER ***
+@@ -1107,12 +1108,21 @@
+ 	safeWriteToFile(destMountPoint+'/System/Settings/resolv.conf.tail', o, logger)
+ 
+ 	genFstabParams = ''
++	swapZvol = False
+ 	if installer.getValue('SwapFile') == 1 :
+-		swapFileName = '/Data/Variable/swap'
+-		genFstabParams += ' --swap-file '+swapFileName
+ 		size = int(installer.getValue('SwapSize'))
+-		safeRun('dd if=/dev/zero of=%s%s bs=1M count=%d'%(destMountPoint,swapFileName,size))
+-		safeRun('mkswap %s%s' %(destMountPoint,swapFileName))
++		if installer.getValue('PartitionType')[1] == 'ZFS' :
++			# ZFS cannot back a swap file (swapon fails on ZFS files). Create a
++			# dedicated swap zvol; Gobo's custom SysVinit activates it via swapon -a.
++			safeRun('zfs create -V %dM -b 4096 rpool/SWAP'%size)
++			safeRun('udevadm settle')
++			safeRun('mkswap /dev/zvol/rpool/SWAP')
++			swapZvol = True
++		else :
++			swapFileName = '/Data/Variable/swap'
++			genFstabParams += ' --swap-file '+swapFileName
++			safeRun('dd if=/dev/zero of=%s%s bs=1M count=%d'%(destMountPoint,swapFileName,size))
++			safeRun('mkswap %s%s' %(destMountPoint,swapFileName))
+ 
+ 	############################################################################
+ 	# Create fstab
+@@ -1127,6 +1137,12 @@
+ 	cmd = 'GenFstab %s %s > %s/System/Settings/fstab'%(espParams, genFstabParams,destMountPoint)
+ 	safeRun(cmd, 'fstab generation', 0, logger)
+ 
++	if swapZvol :
++		fstab_path = destMountPoint+'/System/Settings/fstab'
++		lines = safeFileReadLines(fstab_path, logger)
++		if not any('/dev/zvol/rpool/SWAP' in line for line in lines) :
++			lines.append('/dev/zvol/rpool/SWAP none swap defaults 0 0')
++			safeWriteToFile(fstab_path, "\n".join(lines)+"\n", logger)
+ 	lines = safeFileReadLines(destMountPoint+'/System/Settings/fstab', logger)
+ 	lines = [x for x in lines if x and x[0] != '#' and x.find('/Mount/') > -1]
+ 	mountList = [x.split()[1] for x in lines]

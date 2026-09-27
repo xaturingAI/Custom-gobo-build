@@ -1,0 +1,174 @@
+# GoboLinux ZFS-root support for the custom SysVinit runtime
+# Companion to goboLinuxInstaller-xfs-zfs.patch (installer ZFS pool/GRUB).
+# Apply with: cd / && patch -p1 < gobo-zfs-sysvinit-support.patch
+#
+--- a/Programs/OpenZFS/2.4.4/lib/dracut/modules.d/90zfs/module-setup.sh
++++ b/Programs/OpenZFS/2.4.4/lib/dracut/modules.d/90zfs/module-setup.sh
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env bash
++# gobo livefix 45: make 90zfs work on the SysVinit hierarchy
+ # shellcheck disable=SC2154
+ 
+ check() {
+@@ -50,6 +51,24 @@
+ 		fi
+ 	fi
+ 
++	# GoboLinux boots with a custom SysVinit runtime: OpenZFS binaries live
++	# under /Programs/.../bin behind the /System/Index symlink farm, and dracut
++	# copies the resolved real file into the initramfs at its /Programs path - which
++	# is NOT on the initramfs PATH. Anchor the toolchain into /sbin so the classic
++	# import/mount hooks below can actually find it.
++	for _tool in zpool zfs mount.zfs zgenhostid; do
++		_real="$(command -v "${_tool}" | xargs -r readlink -f)"
++		if [ -n "${_real}" ] && [ -x "${_real}" ]; then
++			inst "${_real}" "/sbin/${_tool}" || {
++				dfatal "Failed to install ${_tool} into initramfs /sbin"
++				exit 1
++			}
++		else
++			dfatal "ZFS tool ${_tool} not found; cannot build a ZFS initramfs"
++			exit 1
++		fi
++	done
++
+ 	inst_hook cmdline 95 "${moddir}/parse-zfs.sh"
+ 	if [[ -n "${systemdutildir}" ]]; then
+ 		inst_script "${moddir}/zfs-generator.sh" "${systemdutildir}/system-generators/dracut-zfs-generator"
+@@ -75,7 +94,7 @@
+ 		fi
+ 	fi
+ 
+-	if dracut_module_included "systemd"; then
++	if dracut_module_included "systemd" && [ -f "${systemdsystemunitdir}/zfs-import.target" ]; then
+ 		inst_simple "${systemdsystemunitdir}/zfs-import.target"
+ 		systemctl -q --root "${initdir}" add-wants initrd.target zfs-import.target
+ 
+--- a/Programs/ConfigTools/017.01/bin/GenGrubConf
++++ b/Programs/ConfigTools/017.01/bin/GenGrubConf
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env python3
++# gobo livefix 45: ZFS root + installed-initramfs fixes
+ 
+ # Routines to generate a GoboLinux-friendly grub.cfg
+ # Written by Lucas C. Villa Real <lucasvr@gobolinux.org>
+@@ -18,6 +19,7 @@
+ 		kernel_build_nr = platform.uname()[3].split()[0].strip("#")
+ 		if kernel_build_nr != "1":
+ 			self.kernel_release += "-{}".format(kernel_build_nr)
++		self.zfs_root = None
+ 		self.data = None
+ 
+ 	def makeConfig(self, grubconf):
+@@ -30,6 +32,9 @@
+ 		cmd_env["GRUB_DISTRIBUTOR"] = "GoboLinux"
+ 		cmd_env["GRUB_DISABLE_RECOVERY"] = "true"
+ 		cmd_env["GRUB_CMDLINE_LINUX"] = "vt.default_utf8=1 brd.rd_nr=0 hid_apple.iso_layout=0 hid_apple.fnmode=2 video=LVDS-1:e video=HDMI-1:e video=VGA=1:e rootwait net.ifnames=0"
++		self.zfs_root = self.zfsRootDataset()
++		if self.zfs_root :
++			cmd_env["GRUB_CMDLINE_LINUX"] += " root=zfs:{} boot=zfs".format(self.zfs_root)
+ 		subprocess.Popen(["grub-mkconfig", "-o", self.grubconf], env=cmd_env).wait()
+ 
+ 		if not is_uefi() and os.path.exists("/System/Kernel/Boot/grub/grubenv"):
+@@ -42,6 +47,8 @@
+ 		self.__updateMenuEntryLabels()
+ 		self.__makeVesaEntries()
+ 		self.__uuid2partuuid()
++		self.__fixZfsRoot()
++		self.__ensureInitrd()
+ 
+ 		f = open(grubconf, "w")
+ 		f.write(self.data)
+@@ -94,6 +101,64 @@
+ 				self.data = self.data.replace("root=UUID={}".format(this_uuid), "root=PARTUUID={}".format(this_partuuid))
+ 				self.data = self.data.replace("root={}".format(this_dev), "root=PARTUUID={}".format(this_partuuid))
+ 
++	def zfsRootDataset(self) :
++		try :
++			source = subprocess.check_output(["findmnt", "-no", "SOURCE", "/"]).decode("utf-8").strip("\n")
++		except Exception :
++			return None
++		if not source or source.startswith("/") :
++			return None
++		pool = source.split("/")[0]
++		try :
++			name = subprocess.check_output(["zpool", "list", "-H", "-o", "name", pool]).decode("utf-8").strip("\n")
++		except Exception :
++			return None
++		return source if name == pool else None
++
++	def __fixZfsRoot(self) :
++		if self.zfs_root is None :
++			return
++		out = []
++		insmod_done = False
++		boot_param = "root=zfs:{} boot=zfs".format(self.zfs_root)
++		for raw in self.data.split("\n") :
++			line = raw
++			first = line.strip().split(" ", 1)[0] if line.strip() else ""
++			if first == "linux" :
++				row = [tok for tok in line.split() if not tok.startswith("root=")]
++				line = " ".join(row) + " " + boot_param
++			out.append(line)
++			if first == "menuentry" and not insmod_done :
++				out.append("\tinsmod zfs")
++				insmod_done = True
++		self.data = "\n".join(out) + "\n"
++
++	def __ensureInitrd(self) :
++		# grub-mkconfig 10_linux only emits an initrd line for an image named
++		# exactly initramfs-${version}.img. Gobo bakes initramfs-<release>.img and
++		# releases often carry a "-Gobo" suffix, so 10_linux misses it and the entry
++		# would boot with no initramfs at all. Point every kernel entry at the
++		# actual image that shipped instead.
++		boot_dir = "/System/Kernel/Boot"
++		try :
++			images = sorted(n for n in os.listdir(boot_dir) if n.startswith("initramfs-") and n.endswith(".img"))
++		except Exception :
++			images = []
++		if not images :
++			return
++		initramfs = images[-1]
++		out = []
++		for raw in self.data.split("\n") :
++			line = raw
++			first = line.strip().split(" ", 1)[0] if line.strip() else ""
++			if first == "initrd" :
++				continue
++			out.append(line)
++			if first == "linux" :
++				indent = line[:len(line) - len(line.lstrip())]
++				out.append("{}initrd /{}/{}".format(indent, boot_dir.strip("/"), initramfs))
++		self.data = "\n".join(out) + "\n"
++
+ def main():
+ 	if len(sys.argv) != 2:
+ 		print("Syntax: {} <grubDir>".format(sys.argv[0]))
+--- a/Programs/Linux/7.1.5/bin/WriteBoot64
++++ b/Programs/Linux/7.1.5/bin/WriteBoot64
+@@ -88,7 +88,8 @@
+       --force \
+       --zstd \
+       --stdlog 2 \
+-      --install-optional /usr/libexec/elogind-uaccess-command
++      --install-optional /usr/libexec/elogind-uaccess-command \
++      --add zfs    # gobo livefix 45
+    # "elogind-uaccess-command" is necessairy due to "CONFIG_HAVE_UACCESS_VALIDATION=y"
+    # in the kernel config. Else we get a warning on boot.
+ 
+--- a/Programs/BootScripts/Settings/BootScripts/BootUp
++++ b/Programs/BootScripts/Settings/BootScripts/BootUp
+@@ -1,4 +1,5 @@
+ #!/bin/sh
++# gobo livefix 45: settle before swapon so ZFS swap zvols exist
+ 
+ # Remount root file system read-write
+ mount -n -o remount,rw /
+@@ -24,6 +25,7 @@
+ # Configure loopback device
+ ifconfig lo 127.0.0.1
+ 
++Exec "Waiting for udev to settle..."      udevadm settle
+ Exec "Activating all swap files/partitions..." swapon -a &
+ Exec "Setting hostname to $HostName..."        hostname "$HostName"
+ 
