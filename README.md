@@ -1,3 +1,5 @@
+You need to Download the main ISO from the Gobo Linux site 
+
 # gobo-build — Custom GoboLinux LiveCD builder
 
 Builds a custom **GoboLinux 017.01** live ISO on an Arch/CachyOS host, adding a
