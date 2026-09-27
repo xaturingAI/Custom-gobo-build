@@ -1,4 +1,4 @@
-You need to Download the main ISO from the Gobo Linux site 
+You need to Download the main ISO from the Gobo Linux site  you need  about 175 gb to build the iso 
 
 # gobo-build — Custom GoboLinux LiveCD builder
 
