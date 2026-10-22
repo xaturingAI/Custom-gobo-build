@@ -5,12 +5,18 @@
 #        'menu'             -> same interactive component menu
 #        --component flags  -> non-interactive build of the selected
 #                              components (--lib32 --wayland --vulkan --gaming
-#                              --extras --pantheon --plasma --iso --all --list)
+#                              --extras --mesa --pantheon --plasma --iso --all --list)
 #        'all'              -> the full build (kernel -> merge -> livefix)
 #        '<step>'           -> run one predefined step (see list below)
-#        'pkg <prog> <ver>' -> single compile+package (mirrors old /tmp helpers)
+#        'pkg <prog> [ver]' -> single compile+package (ver omitted = newest
+#                              version dir; name matches case-insensitively)
 #        'pkgkeep ..'       -> single compile+package in-place (--keep)
-# Steps: proton sync linux nvidia glibc32 lib32 cmake seatd tools wayland swayextras vulkan steam winetools mingw winedev protonplus lutris ffxiv fastfetch pycompat pyxml aliens core elogind_base flatpak sddm extras network pipewire pantheon merge livefix test pkg pkgkeep all
+#        'pkgforced ..'     -> force a real download+build of an ALREADY
+#                              installed program (drops the cached archive and
+#                              the package tarball, then Compile --keep), so a
+#                              recipe that was never compiled is actually
+#                              exercised instead of merely re-packaged
+# Steps: proton sync aliens linux nvidia nvdiag glibc32 lib32 cmake seatd tools wayland swayextras vulkan steam winetools mingw winedev pycompat pyxml core elogind_base flatpak sddm extras lutris protonplus fastfetch ffxiv music nodejs go fzf html5lib qtwebengine sddmdeps odin v dotnet opencode claude ollama network modem devices phone pipewire mesa pantheon webkit appimage fs plasma merge livefix gamekcm test pkg pkgkeep pkgforced all
 
 export TERM=xterm
 export HOME=/Users/root
@@ -129,9 +135,10 @@ step_aliens() {
     mkdir -p "$aliens_root/Cargo/bin"
     mkdir -p "$aliens_root/Go/bin"
     mkdir -p "$aliens_root/Odin"
-    log "Pre-created /System/Aliens/{NPM,Cargo/bin,Go/bin,Odin} scaffolds in merged root"
+    mkdir -p "$aliens_root/Dotnet"
+    log "Pre-created /System/Aliens/{NPM,Cargo/bin,Go/bin,Odin,Dotnet} scaffolds in merged root"
     local installed=0
-    for plugin in Alien-NPM Alien-Cargo Alien-Go Alien-Odin
+    for plugin in Alien-NPM Alien-Cargo Alien-Go Alien-Odin Alien-Dotnet
     do
         if [ ! -f "$repo_bin/$plugin" ]
         then
@@ -148,6 +155,11 @@ step_aliens() {
 }
 
 step_sync() {
+    # The recipe tree the build actually uses lives in /Data/Compile/Recipes,
+    # NOT in the repo (which is mounted read-only at /mnt/repo).  step_sync
+    # copies the repo's recipes over it.  Always run it from the compile
+    # directory, whatever the current working directory happens to be.
+    cd /Data/Compile || return 1
     log "Syncing recipes from /mnt/repo into /Data/Compile/Recipes"
     for r in Linux Glibc Glibc-32 CMake Vulkan-Headers Vulkan-Loader Vulkan-Tools Nvidia \
              XKBcommon LibInput LibXKBfile LibXcvt LibDrm Scdoc LibDecor \
@@ -155,10 +167,21 @@ step_sync() {
              OpenSSL Python PyCairo PyGObject \
              Qt Qt5Wayland VLC \
              OpenCL-Headers Clinfo VDPAUInfo \
-             Xrandr Mesa-Utils P7zip OpenAL FastFetch
+             Xrandr P7zip OpenAL FastFetch Refind LibEGL
     do
         rm -rf "Recipes/$r"
         cp -a "/mnt/repo/Recipes/$r" "Recipes/$r"
+    done
+    # mesa-core recipes (canonical source Recipes/mesa-core/): every Mesa-stack
+    # package (Mesa, Mesa-Utils, Lib32-mesa) lives there, together with the
+    # packages that only exist because Mesa's dependency closure needs them
+    # (ELFUtils -> libelf for radeonsi; LibXxf86vm/LibXRandR -> xxf86vm.pc and
+    # xrandr.pc for glx=dri + xlib-lease; Eudev -> libudev.pc; Zstd ->
+    # libzstd.pc). Lib32-mesa was moved out of the 32-Bit-Libs/ loop below.
+    for r in Mesa Mesa-Utils Lib32-mesa ELFUtils Eudev Zstd LibXxf86vm LibXRandR Vulkan-Intel
+    do
+        rm -rf "Recipes/$r"
+        cp -a "/mnt/repo/Recipes/mesa-core/$r" "Recipes/$r"
     done
     # Nvidia-Settings lives nested under Recipes/Nvidia/, but Compile resolves
     # it as a FLAT app name (Find_Recipe greps top-level dirs for ^Nvidia-Settings$),
@@ -166,15 +189,24 @@ step_sync() {
     # recipe (recipe_type=configure) gets used and the pure-Makefile build fails.
     rm -rf "Recipes/Nvidia-Settings"
     cp -a "/mnt/repo/Recipes/Nvidia/Nvidia-Settings" "Recipes/Nvidia-Settings"
+    # Nvidia-Utils is the second flat recipe nested under Recipes/Nvidia/ (the
+    # Arch-style userspace split: libs, tools, Vulkan ICDs, glvnd EGL vendor
+    # JSONs). Same flat-copy requirement as Nvidia-Settings.
+    rm -rf "Recipes/Nvidia-Utils"
+    cp -a "/mnt/repo/Recipes/Nvidia/Nvidia-Utils" "Recipes/Nvidia-Utils"
+    # Lib32-Nvidia-Utils is the third flat recipe nested under Recipes/Nvidia/
+    # (the 32-bit half of the driver .run). Same flat-copy requirement.
+    rm -rf "Recipes/Lib32-Nvidia-Utils"
+    cp -a "/mnt/repo/Recipes/Nvidia/Lib32-Nvidia-Utils" "Recipes/Lib32-Nvidia-Utils"
     # Gaming recipes (canonical source Recipes/Gaming/)
-    for r in Steam Lutris Heroic Protontricks RenPy LMMS ProtonPlus
+    for r in Steam Lutris Heroic Protontricks RenPy LMMS ProtonPlus FFXIVQuickLauncher
     do
         rm -rf "Recipes/$r"
         cp -a "/mnt/repo/Recipes/Gaming/$r" "Recipes/$r"
     done
     # wayland-core recipes (canonical source Recipes/wayland-core/);  all
-    # recipes listed here MUST also stay in step_wayland's compile order.
-    for r in Wayland Wayland-Protocols EGLExternalPlatform EGL-Wayland SeatD \
+    # recipes listed here MUST also stay in step_waylandcore/step_sway order.
+    for r in Wayland Wayland-Protocols EGLExternalPlatform EGL-Wayland EGL-Wayland2 SeatD \
              XorgProto Wlroots XWayland Wlr-Protocols Wlr-Randr Wayland-Utils
     do
         rm -rf "Recipes/$r"
@@ -198,8 +230,9 @@ step_sync() {
              Lib32-Xcomposite Lib32-Xdamage Lib32-Xss Lib32-Xfixes Lib32-Xtst \
              Lib32-DBus Lib32-FreeType Lib32-Fontconfig Lib32-libpng Lib32-zlib \
              Lib32-libxml2 Lib32-expat Lib32-libxcb Lib32-alsa-lib Lib32-libpulse \
+             Lib32-libpulsecommon \
              Lib32-xkbcommon Lib32-libgcc Lib32-libstdcpp \
-             Lib32-libglvnd Lib32-mesa Lib32-vulkan-loader Lib32-libsndfile Lib32-SDL2 \
+             Lib32-libglvnd Lib32-vulkan-loader Lib32-libsndfile Lib32-SDL2 \
              Lib32-glib Lib32-gnutls Lib32-openssl Lib32-sqlite Lib32-gdk-pixbuf Lib32-pango \
              Lib32-libjpeg Lib32-harfbuzz Lib32-fribidi Lib32-libxft \
              Lib32-gstreamer Lib32-gst-plugins-base Lib32-libtiff Lib32-mpg123 Lib32-libv4l \
@@ -208,7 +241,7 @@ step_sync() {
              Lib32-curl Lib32-drm Lib32-gpg Lib32-gtk Lib32-idn Lib32-krb5 Lib32-ssh \
              Lib32-libffi Lib32-PCRE2 Lib32-libmount Lib32-libblkid Lib32-libselinux \
              Lib32-libcap Lib32-libdatrie Lib32-libthai Lib32-libsystemd Lib32-graphite2 \
-             Lib32-brotli
+             Lib32-brotli Lib32-FLAC Lib32-LAME
     do
         rm -rf "Recipes/$r"
         cp -a "/mnt/repo/Recipes/32-Bit-Libs/$r" "Recipes/$r"
@@ -237,7 +270,7 @@ step_sync() {
     for r in GLib GObject-Introspection PCRE2 HarfBuzz Fribidi JSON-GLib Pango GdkPixbuf Graphene LCMS2 Libei \
              Libdisplay-Info GSettings-Desktop-Schemas Sysprof-Capture Libwacom LibEvdev LibPipewire \
              LibCanberra LibGudev GUsb IsoCodes Colord Gnome-Desktop GTK4 LibAdwaita LibX11 LibXfixes Mutter \
-             Elogind LibGLVnd LLVM Mesa \
+             Elogind LibGLVnd LLVM SPIRV-Headers SPIRV-Tools SPIRV-LLVM-Translator LibCLc \
              FreeType Fontconfig Pixman Cairo HWData Linux-Headers
     do
         rm -rf "Recipes/$r"
@@ -254,7 +287,8 @@ step_sync() {
     # Pantheon: elementary libraries + themes
     for r in ElementaryIconTheme ElementaryWallpapers GtkThemeElementary SoundThemeElementary \
              Contractor Granite Granite7 Libgee Libhandy Vala \
-             ATK GTK+ GStreamer Gst-Plugins-Base Gst-Plugins-Good Gst-LibAV VTE Gcr4 \
+             ATK GTK+ GStreamer Gst-Plugins-Base Gst-Plugins-Good Gst-Plugins-Bad \
+             Gst-Plugins-Ugly Gst-LibAV VTE Gcr4 \
              Ruby LibHyphen Unifdef LibIcal WebKit2GTK WebKitGTK \
              Cogl Clutter ClutterGtk LibChamplain EvolutionDataServer Folks \
              GtkSourceView LibPeas LibGit2 LibGit2-Glib \
@@ -441,7 +475,7 @@ EOF
 
 packaged() {
     # Version-exact match: a different-version tarball must not block the
-    # pinned build (e.g. step_wayland's LibInput 1.26.2 must not stop
+    # pinned build (e.g. step_waylandcore's LibInput 1.26.2 must not stop
     # step_pantheon from building 1.31.3 that Mutter needs). The merge step
     # replaces older versions, so co-existing tarballs are safe.
     [ -f "$B/Packages/$1--$2--x86_64.tar.bz2" ]
@@ -456,6 +490,18 @@ installed() {
     [ -d "/Programs/$prog/$ver" ] && [ ! -e "/Programs/$prog/$ver-failed" ]
 }
 
+# A recipe may declare `no_strip=1` (e.g. opencode-bin: opencode's prebuilt
+# single-file ELF embeds the Bun runtime + app; Compile's do_strip rips out the
+# app payload, leaving a binary that boots as a bare "Bun is a fast JavaScript
+# runtime..." — exactly what the AUR PKGBUILD's '!strip' guards against).
+# Normalize it into Compile's --no-strip so EVERY entrypoint that calls the
+# helpers here (pkg / pkgkeep / pkgforced / step_*) honors it automatically.
+recipe_no_strip() {
+    local prog="$1" ver="$2" recipe
+    recipe="/Data/Compile/Recipes/$prog/$ver/Recipe"
+    [ -f "$recipe" ] && grep -q '^no_strip=1' "$recipe"
+}
+
 compile() {
     # Optional trailing args are forwarded to Compile (e.g. `compile Pkg Ver
     # --lazy` to RESUME an existing partially-built source tree: Compile --batch
@@ -463,6 +509,7 @@ compile() {
     # tree, reusing built objects, and skips unpack/reconfig/repatch).
     local prog="$1" ver="$2"; shift 2
     local extra=("$@")
+    recipe_no_strip "$prog" "$ver" && extra+=(--no-strip)
     if packaged "$prog" "$ver"
     then log "SKIP: $prog $ver (package tarball already present)"
     elif installed "$prog" "$ver"
@@ -486,13 +533,15 @@ compile_keep() {
     # With --keep the existing tree stays live (build deps remain loadable)
     # and SandboxInstall overlays the new files onto it.
     local prog="$1" ver="$2"
+    local extra=()
+    recipe_no_strip "$prog" "$ver" && extra+=(--no-strip)
     if packaged "$prog" "$ver"
     then log "SKIP: $prog $ver (package tarball already present)"
     elif installed "$prog" "$ver"
     then log "SKIP: $prog $ver (already installed in /Programs)"
     else
         log ">>> Compiling $prog $ver (in-place, --keep)"
-        Compile "$prog" "$ver" --batch --keep </dev/null 2>&1 | tee "$B/logs/$prog.log"; [ ${PIPESTATUS[0]} -eq 0 ] || {
+        Compile "$prog" "$ver" --batch --keep "${extra[@]}" </dev/null 2>&1 | tee "$B/logs/$prog.log"; [ ${PIPESTATUS[0]} -eq 0 ] || {
             log "FAILED: $prog $ver (see $B/logs/$prog.log)"
             return 1
         }
@@ -509,9 +558,11 @@ compile_forced() {
     # first so package() regenerates it. Used by step_nvidia / step_fs when the
     # module-presence guard fails.
     local prog="$1" ver="$2"
+    local extra=()
+    recipe_no_strip "$prog" "$ver" && extra+=(--no-strip)
     rm -f "$B/Packages/$prog--$ver--x86_64.tar.bz2"
     log ">>> Forcing in-place rebuild of $prog $ver (--keep)"
-    Compile "$prog" "$ver" --batch --keep </dev/null 2>&1 | tee "$B/logs/$prog.log"; [ ${PIPESTATUS[0]} -eq 0 ] || {
+    Compile "$prog" "$ver" --batch --keep "${extra[@]}" </dev/null 2>&1 | tee "$B/logs/$prog.log"; [ ${PIPESTATUS[0]} -eq 0 ] || {
         log "FAILED: $prog $ver (see $B/logs/$prog.log)"
         return 1
     }
@@ -539,6 +590,97 @@ package() {
     fi
 }
 
+# Echo the archive file names a recipe downloads, as they are named in
+# /Data/Compile/Archives.  Three sources, deduplicated by the caller:
+#   1. an explicit files=() array;
+#   2. the basename of every quoted `url` / `*_url` assignment (url=,
+#      deb_glx_url=, ...) -- GoboLinux names the archive after the URL unless
+#      files=/file_names override it;
+#   3. any quoted literal ending in an archive extension, which catches files a
+#      recipe fetches itself into a fixed local name -- e.g. Lib32-mesa's
+#      pre_install curls $deb_glx_url/$deb_egl_url into
+#      libglx-mesa0_i386.deb / libegl-mesa0_i386.deb, so the URL basename (2)
+#      is not what lands in the cache.  For the "name:url:localname" pair
+#      strings used there, only the last colon-separated component is a file.
+# Used by `pkgforced` to drop the cache so the `url` is really exercised instead
+# of FetchArchive short-circuiting on a cached file.
+recipe_archives() {
+    local prog="$1" ver="$2" recipe
+    recipe="/Data/Compile/Recipes/$prog/$ver/Recipe"
+    [ -f "$recipe" ] || return 0
+    if grep -q '^[[:space:]]*files=(' "$recipe"
+    then
+        awk '/^[[:space:]]*files=\(/{f=1} f{print} f&&/\)/{exit}' "$recipe" \
+            | sed 's/^[[:space:]]*files=(//' \
+            | tr -d '"()' | tr -s '[:space:]' '\n' | grep -v '^$'
+    fi
+    grep -oP '^[[:space:]]*[A-Za-z0-9_]*url=\K"[^"]*"' "$recipe" \
+        | tr -d '"' | sed 's#.*/##'
+    grep -oP '"[^"]+\.(deb|tar\.(gz|bz2|xz|lzma|zst)|tgz|txz|zip)"' "$recipe" \
+        | grep -v '://' | tr -d '"' | sed 's#.*[:|]##; s#.*/##'
+}
+
+# Resolve the `<Program> [Version]` arguments shared by the `pkg`, `pkgkeep`
+# and `pkgforced` steps: case-insensitive name lookup with a unique-substring
+# fallback, sync of a missing local recipe copy from any /mnt/repo tier dir, and
+# newest-version auto-selection when the version is omitted.  Sets the globals
+# _prg (canonical recipe basename) and _ver, which the callers then pass on.
+#   $1: step name (error text only)   $2: <Program>   $3: [Version]
+resolve_pkg_args() {
+    local _step="$1" _want="$2" _rcp _all _n _base
+    [ -n "$_want" ] || { echo "usage: build.sh $_step <Program> [Version]"; exit 1; }
+    _prg="$_want"
+    _ver="${3:-}"
+    if [ ! -d "Recipes/$_prg" ]
+    then
+        _rcp=""
+        for _base in /mnt/repo/Recipes Recipes
+        do
+            [ -d "$_base" ] || continue
+            # Exact basename first (case-insensitive)...
+            _rcp="$(find "$_base" -maxdepth 2 -type d -iname "$_prg" 2>/dev/null | head -1)"
+            if [ -z "$_rcp" ]
+            then
+                # ...then a unique substring fallback (claude -> Claude-Desktop).
+                # Multiple hits are an error, never a guess: Find_Recipe would
+                # die on ambiguous names anyway.
+                _all="$(find "$_base" -maxdepth 2 -type d -iname "*$_prg*" 2>/dev/null)"
+                _n=0
+                [ -n "$_all" ] && _n="$(printf '%s\n' "$_all" | grep -c .)"
+                if [ "$_n" -eq 1 ]
+                then _rcp="$_all"
+                elif [ "$_n" -gt 1 ]
+                then
+                    echo "ambiguous pattern '$_prg'; candidates:"
+                    printf '  %s\n' $_all
+                    exit 1
+                fi
+            fi
+            [ -n "$_rcp" ] && break
+        done
+        [ -n "$_rcp" ] || { echo "recipe $_prg not found (run 'sync' first)"; exit 1; }
+        # Always use the CANONICAL basename (Claude-Desktop, not claude):
+        # Find_Recipe is case-insensitive, so a lowercase twin dir would match
+        # twice and kill the lookup.
+        _prg="$(basename "$_rcp")"
+        case "$_rcp" in
+            /mnt/repo/*)
+                rm -rf "Recipes/$_prg"
+                cp -a "$_rcp" "Recipes/$_prg"
+                log "synced recipe $_prg from /mnt/repo" ;;
+        esac
+        unset _rcp _all _n _base
+    fi
+    if [ -z "$_ver" ]
+    then
+        _ver="$(find "Recipes/$_prg" -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/Recipe' \; -print 2>/dev/null | sort -V | tail -1)"
+        _ver="$(basename "$_ver")"
+        [ -n "$_ver" ] || { echo "no version dir with a Recipe under Recipes/$_prg"; exit 1; }
+        log "auto-selected version $_ver for $_prg"
+    fi
+    [ -f "Recipes/$_prg/$_ver/Recipe" ] || { echo "recipe $_prg/$_ver not found (run 'sync' first)"; exit 1; }
+}
+
 # ---------------------------------------------------------------------------
 # Interactive kernel / auto-driver selection.
 # Prompts run only when stdin is a terminal (interactive `run-build.sh linux`
@@ -546,7 +688,7 @@ package() {
 # $B/.build-select (same store as the component menu), so pressing Enter keeps
 # the previous selection.  Choices currently supported:
 #   kernel     = linux (stock mainline 7.1.5) | cachyos (7.2.5-1) | none
-#   autodriver = nvidia (Nvidia 580.159.04)   | none
+#   autodriver = nvidia (Nvidia 615.71.09)   | none
 # ---------------------------------------------------------------------------
 
 # Prompt: which kernel to build. Sets KERNEL_CHOICE: linux | cachyos | none.
@@ -582,20 +724,31 @@ select_kernel() {
 # Prompt: which auto-driver stack to compile. Sets AUTODRIVER_CHOICE: nvidia | none.
 select_autodriver() {
     local def="$(comp_select_default autodriver)" ans
+    # 'intel' and 'none' are honoured as-is; anything else falls back to
+    # nvidia (the historical default). Note AUTODRIVER_CHOICE is unset until
+    # this runs, hence no reference to it here.
     case "$def" in
-        none) ;; *) def=nvidia ;;
+        none|intel) ;;
+        *) def=nvidia ;;
     esac
     if [ -t 0 ]
     then
         echo
         echo "Auto-driver selection:"
-        echo "  1) Nvidia 580.159.04  (proprietary NVIDIA kernel modules + Xorg/udev wiring)"
+        echo "  1) Nvidia 615.71.09  (proprietary NVIDIA kernel modules + Xorg/udev wiring)"
+        echo "  2) Intel  (iris gallium driver -- lives inside the Mesa package, needs the i915 DRM module)"
         echo "  n) skip auto-drivers"
-        printf 'Which auto-driver to compile? [%s] : ' "$([ "$def" = none ] && echo n || echo "$def")"
+        case "$def" in
+            none)  local shown=n ;;
+            intel) local shown=2 ;;
+            *)     local shown=1 ;;
+        esac
+        printf 'Which auto-driver to compile? [%s] : ' "$shown"
         read -r ans || ans=""
         case "${ans,,}" in
             n|no|0|skip|none) def=none ;;
             1|nvidia|nv) def=nvidia ;;
+            2|intel|i915|iris) def=intel ;;
             "") : ;;
             *) echo "  Invalid choice '${ans}'; keeping ${def}" ;;
         esac
@@ -653,39 +806,105 @@ nvidia_modules_ok() {
 }
 
 step_nvidia() {
-    if [ -z "$AUTODRIVER_CHOICE" ]; then select_autodriver; fi
+    if [ -z "${AUTODRIVER_CHOICE:-}" ]; then select_autodriver; fi
     log "Auto-driver selected: $AUTODRIVER_CHOICE"
     if [ "$AUTODRIVER_CHOICE" = none ]
     then log "SKIP: auto-driver build declined (autodriver=none)"
          return 0
     fi
+    # Intel is not a standalone driver package: iris is a gallium driver that
+    # ships inside Mesa, and the kernel side is the in-tree i915 module that
+    # CONFIG_DRM_I915=m already provides. So "selecting Intel" means rebuilding
+    # the Mesa package with iris enabled in gallium-drivers, which is exactly
+    # what ensure_mesa does (and it is the same Mesa the live session loads).
+    # Returning early keeps the proprietary NVIDIA path -- and its kernel
+    # modules -- entirely out of an Intel build.
+    if [ "$AUTODRIVER_CHOICE" = intel ]
+    then
+        ensure_mesa || return 1
+        log "OK: Intel driver (Mesa iris gallium + i915 DRM)"
+        return 0
+    fi
     # Always re-stage the Nvidia recipe from the repo: a standalone
     # `run-build.sh nvidia` skips step_sync, and a stale recipe would silently
-    # rebuild with the old, kernel-7.2.5-incompatible sources (strncpy etc.).
+    # rebuild the old driver version (or the old 580.159.04 tree, whose kernel
+    # patches do not apply to 615.71.09).
     rm -rf Recipes/Nvidia
     cp -a /mnt/repo/Recipes/Nvidia Recipes/Nvidia
     log "Nvidia recipe re-staged from /mnt/repo/Recipes/Nvidia"
+    # Flatten the userspace recipe nested under Recipes/Nvidia/ so Find_Recipe /
+    # Compile resolve it as a top-level app (same reason as Nvidia-Settings).
+    rm -rf Recipes/Nvidia-Utils
+    cp -a Recipes/Nvidia/Nvidia-Utils Recipes/Nvidia-Utils
     # A tarball OR an installed tree can both predate the current kernel (this
     # step recently packaged a stale tree that compile() had skipped via its
     # installed() guard after a deleted tarball). The module check is the source
     # of truth: if it passes, only a missing tarball needs fixing; otherwise the
     # driver must be rebuilt for the CURRENT kernel regardless of what exists.
     if nvidia_modules_ok
-    then if packaged Nvidia 580.159.04
-         then log "SKIP: Nvidia 580.159.04 (tarball present, kernel modules verified)"
-              return 0
+    then if packaged Nvidia 615.71.09
+         then log "SKIP: Nvidia 615.71.09 (tarball present, kernel modules verified)"
+         else log "Nvidia kernel modules present but tarball missing -> packaging installed tree"
+              package Nvidia 615.71.09 && log "OK: NVIDIA kernel modules installed under $(ls /Programs/Linux/Current/lib/modules)"
          fi
-         log "Nvidia kernel modules present but tarball missing -> packaging installed tree"
-         package Nvidia 580.159.04 && log "OK: NVIDIA kernel modules installed under $(ls /Programs/Linux/Current/lib/modules)"
-         return 0
+    else
+         log "Nvidia kernel modules missing/stale for the current kernel -> forcing rebuild"
+         if installed Nvidia 615.71.09
+         then compile_forced Nvidia 615.71.09 && package Nvidia 615.71.09
+         else compile Nvidia 615.71.09 && package Nvidia 615.71.09
+         fi &&
+         nvidia_modules_ok && log "OK: NVIDIA kernel modules installed under $(ls /Programs/Linux/Current/lib/modules)" || return 1
     fi
-    log "Nvidia kernel modules missing/stale for the current kernel -> forcing rebuild"
-    if installed Nvidia 580.159.04
-    then compile_forced Nvidia 580.159.04 && package Nvidia 580.159.04
-    else compile Nvidia 580.159.04 && package Nvidia 580.159.04
-    fi &&
-    nvidia_modules_ok && log "OK: NVIDIA kernel modules installed under $(ls /Programs/Linux/Current/lib/modules)"
+    # The driver package no longer ships the userspace: build it too, so a plain
+    # `run-build.sh nvidia` still yields the complete stack (driver + nvidia-utils
+    # + nvidia-settings).
+    step_nvidia_utils || return 1
+    step_lib32_nvidia_utils || return 1
+    step_nvidia_settings
 }
+
+# Arch-style "nvidia-utils" userspace split: same .run as Nvidia, but ships the
+# 64-bit + transitional 32-bit libraries, the command-line tools, the Vulkan
+# ICDs and the glvnd EGL vendor JSONs. Re-stage from /mnt/repo so a standalone
+# `run-build.sh nvidia-utils` does not depend on step_nvidia having run.
+step_nvidia_utils() {
+    if [ -d /mnt/repo/Recipes/Nvidia/Nvidia-Utils ]
+    then rm -rf Recipes/Nvidia-Utils
+         cp -a /mnt/repo/Recipes/Nvidia/Nvidia-Utils Recipes/Nvidia-Utils
+         log "Nvidia-Utils recipe re-staged from /mnt/repo/Recipes/Nvidia/Nvidia-Utils"
+    fi
+    compile Nvidia-Utils 615.71.09 && package Nvidia-Utils 615.71.09 &&
+        log "OK: NVIDIA userspace (nvidia-utils) installed to /Programs/Nvidia-Utils"
+}
+
+# Arch-style "nvidia-settings" split: built from NVIDIA's own nvidia-settings
+# SOURCE tarball (not the driver .run). Re-stage from /mnt/repo so a standalone
+# `run-build.sh nvidia-settings` does not depend on step_nvidia having run.
+step_nvidia_settings() {
+    if [ -d /mnt/repo/Recipes/Nvidia/Nvidia-Settings ]
+    then rm -rf Recipes/Nvidia-Settings
+         cp -a /mnt/repo/Recipes/Nvidia/Nvidia-Settings Recipes/Nvidia-Settings
+         log "Nvidia-Settings recipe re-staged from /mnt/repo/Recipes/Nvidia/Nvidia-Settings"
+    fi
+    compile Nvidia-Settings 610.57.04 && package Nvidia-Settings 610.57.04 &&
+        log "OK: nvidia-settings 610.57.04 installed to /Programs/Nvidia-Settings"
+}
+
+# Arch-style "lib32-nvidia-utils" split: the 32-bit half of the SAME driver .run
+# that Nvidia-Utils unpacks. Re-stage from /mnt/repo so a standalone
+# `run-build.sh lib32-nvidia-utils` does not depend on step_nvidia having run.
+step_lib32_nvidia_utils() {
+    if [ -d /mnt/repo/Recipes/Nvidia/Lib32-Nvidia-Utils ]
+    then rm -rf Recipes/Lib32-Nvidia-Utils
+         cp -a /mnt/repo/Recipes/Nvidia/Lib32-Nvidia-Utils Recipes/Lib32-Nvidia-Utils
+         log "Lib32-Nvidia-Utils recipe re-staged from /mnt/repo/Recipes/Nvidia/Lib32-Nvidia-Utils"
+    fi
+    compile Lib32-Nvidia-Utils 615.71.09 && package Lib32-Nvidia-Utils 615.71.09 &&
+        log "OK: NVIDIA 32-bit userspace (lib32-nvidia-utils) installed to /Programs/Lib32-Nvidia-Utils"
+}
+
+# Hyphenated alias for dispatch (bash function names cannot contain hyphens)
+step_lib32-nvidia-utils() { step_lib32_nvidia_utils "$@"; }
 
 # OpenZFS ships zfs.ko (zstd-compressed as zfs.ko.zst) into the *Linux program's*
 # module tree (/Programs/Linux/Current/lib/modules/<release>/extra, which is what
@@ -733,9 +952,13 @@ step_lib32() {
     compile Lib32-Fontconfig 2.13.1 && package Lib32-Fontconfig 2.13.1 &&
     # --- audio ---
     compile Lib32-libpulse 16.0 && package Lib32-libpulse 16.0 &&
+    # libpulsecommon-16.1.so is the versioned private lib libpulse.so.0 links
+    # against; Steam's client needs it as well. Built as its own package from
+    # the same Debian i386 libpulse0 .deb (no standalone upstream tarball).
+    compile Lib32-libpulsecommon 16.1 && package Lib32-libpulsecommon 16.1 &&
     # --- GL/Vulkan (needs X11) ---
     compile Lib32-libglvnd 1.4.0 && package Lib32-libglvnd 1.4.0 &&
-    compile Lib32-mesa 22.3.5 && package Lib32-mesa 22.3.5 &&
+    compile Lib32-mesa 22.3.6 && package Lib32-mesa 22.3.6 &&
     compile Lib32-vulkan-loader 1.3.261.1 && package Lib32-vulkan-loader 1.3.261.1 &&
     # --- crypto/TLS (no deps beyond base) ---
     compile Lib32-openssl 3.0.17 && package Lib32-openssl 3.0.17 &&
@@ -760,6 +983,9 @@ step_lib32() {
     compile Lib32-libogg 1.3.5 && package Lib32-libogg 1.3.5 &&
     compile Lib32-theora 1.1.1 && package Lib32-theora 1.1.1 &&
     compile Lib32-vorbis 1.3.7 && package Lib32-vorbis 1.3.7 &&
+    # libFLAC.so.12 (Steam/Wine) links libogg.so.0 -> Lib32-libogg first.
+    compile Lib32-FLAC 1.4.2 && package Lib32-FLAC 1.4.2 &&
+    compile Lib32-LAME 3.100 && package Lib32-LAME 3.100 &&
     compile Lib32-gsm 1.0.22 && package Lib32-gsm 1.0.22 &&
     compile Lib32-openal 1.19.1 && package Lib32-openal 1.19.1 &&
     compile Lib32-libv4l 1.22.1 && package Lib32-libv4l 1.22.1 &&
@@ -796,6 +1022,8 @@ step_lib32() {
     compile Lib32-libsystemd 257.13 && package Lib32-libsystemd 257.13 &&
     compile Lib32-graphite2 1.3.14 && package Lib32-graphite2 1.3.14 &&
     compile Lib32-brotli 1.1.0 && package Lib32-brotli 1.1.0 &&
+    # --- Vulkan/D3D12 (32-bit vkd3d, needs Lib32-vulkan-loader + Glibc-32) ---
+    compile Lib32-vkd3d 2.1 && package Lib32-vkd3d 2.1 &&
     log "OK: All 32-bit libraries built"
 }
 
@@ -830,51 +1058,147 @@ step_tools() {
     fi
 }
 
-step_wayland() {
+# ---------------------------------------------------------------------------
+# Wayland CORE libraries - the Wayland/EGL stack that other components link
+# against (Vulkan's WSI, GTK, SDL2, EGL-Wayland/EGL-Wayland2, compositors).
+# This is deliberately SEPARATE from the Sway compositor so that `vulkan`,
+# `wayland`, or a desktop build never drag the whole Sway desktop environment
+# in. Re-stage is self-contained (a standalone step skips step_sync).
+# ---------------------------------------------------------------------------
+step_waylandcore() {
     # Dependency order matters:
     #  XKBcommon needs wayland + wayland-protocols (enable-wayland default true);
     #  EGL-Wayland needs eglexternalplatform (EGL_EXT_external_platform headers);
+    #  EGL-Wayland2 also needs libdrm, gbm, wayland-client, wayland-egl-backend
+    #    and wayland-protocols >= 1.38 (linux-drm-syncobj/fifo/commit-timing
+    #    staging XMLs), all present by the time it builds;
     #  XorgProto (>= 2022.2) must precede XWayland: XWayland 24.1.2 requires
     #    inputproto >= 2.3.99.1, which the ISO's XorgProto 2019.2 (2.3.2) lacks;
-    #  LibDrm (>= 2.4.116) also precedes XWayland (ISO ships 2.4.100); wlroots
-    #    0.15.1 additionally needs libdrm >= 2.4.108;
-    #  XWayland must be built BEFORE Wlroots so that wlroots' 'auto' xwayland
-    #    feature finds the 'Xwayland' binary at its own build time;
-    #  Sway last: needs the whole stack + scdoc (man pages);
-    #  wlr-protocols needs wayland-scanner for its 'check' target; wlr-randr and
-    #    wayland-utils build after the core stack (scdoc optional for wlr-randr).
+    #  LibDrm (>= 2.4.116) precedes XWayland (ISO ships 2.4.100); wlroots
+    #    0.15.1 additionally needs libdrm >= 2.4.108.
+    # Re-stage the wayland-core recipes from the repo: a standalone step skips
+    # step_sync, so a recipe that exists only in /mnt/repo (e.g. a newly added
+    # EGL-Wayland2) would not be found by Compile.
+    if [ -d /mnt/repo/Recipes/wayland-core ]
+    then for r in Wayland Wayland-Protocols EGLExternalPlatform EGL-Wayland EGL-Wayland2
+         do [ -d "/mnt/repo/Recipes/wayland-core/$r" ] || continue
+            rm -rf "Recipes/$r"
+            cp -a "/mnt/repo/Recipes/wayland-core/$r" "Recipes/$r"
+         done
+         log "wayland-core recipes re-staged from /mnt/repo"
+    fi
+    # Pixman lives with the Pantheon recipes but Wlroots 0.20.2 needs it:
+    # render/pixman/meson.build requires pixman-1 >= 0.46.0 (the 16-bits-per-
+    # component format PIXMAN_a16b16g16r16 used for DRM_FORMAT_ABGR16161616
+    # only exists from pixman 0.46.0 on).  The wayland step runs BEFORE
+    # step_pantheon (which is where Pixman used to be built), so Pixman has to
+    # be built here as well.  The Wlroots recipe carries a version-guarded
+    # fallback for that one constant, so a failed Pixman upgrade only costs
+    # the 64bpp format - it must not break the wayland stack.
+    if [ -d /mnt/repo/Recipes/Pantheon/Pixman ]
+    then
+        rm -rf "Recipes/Pixman"
+        cp -a "/mnt/repo/Recipes/Pantheon/Pixman" "Recipes/Pixman"
+        log "Pixman recipes re-staged from /mnt/repo"
+    fi
+    # XKBcommon: Wlroots 0.20.2 needs the REAL 1.8.0 - types/wlr_keyboard.c
+    # uses XKB_LED_NAME_COMPOSE / XKB_LED_NAME_KANA, which only exist from
+    # 1.8.0 on (1.7.0 has NUM/CAPS/SCROLL only).  The chroot may still carry
+    # a FAKE 1.8.0 (the 1.7.0 tarball installed under the 1.8.0 name - its
+    # xkbcommon.pc says 1.7.0), so force a rebuild when the installed tree is
+    # not the real thing.
+    if [ -d /mnt/repo/Recipes/XKBcommon ]
+    then
+        rm -rf "Recipes/XKBcommon"
+        cp -a "/mnt/repo/Recipes/XKBcommon" "Recipes/XKBcommon"
+        log "XKBcommon recipes re-staged from /mnt/repo"
+    fi
     step_tools &&
+    ( compile Pixman 0.46.4 && package Pixman 0.46.4 ||
+      log "WARNING: Pixman 0.46.4 unavailable; Wlroots builds without the 64bpp format" ) &&
     compile Wayland 1.23.1 && package Wayland 1.23.1 &&
     compile Wayland-Protocols 1.44 && package Wayland-Protocols 1.44 &&
-    compile XKBcommon 1.7.0 && package XKBcommon 1.7.0 &&
+    # XKBcommon 1.8.0 (real): Wlroots 0.20.2 needs XKB_LED_NAME_COMPOSE and
+    # XKB_LED_NAME_KANA, which only exist from 1.8.0 on.  The chroot may
+    # still carry a FAKE 1.8.0 (the 1.7.0 tarball installed under the 1.8.0
+    # name), so force a rebuild when the installed pkg-config file does not
+    # report 1.8.0.
+    { if [ "$(sed -n 's/^Version:[[:space:]]*//p' /Programs/XKBcommon/1.8.0/lib/pkgconfig/xkbcommon.pc 2>/dev/null | head -1)" = "1.8.0" ]
+      then compile XKBcommon 1.8.0
+      else compile_forced XKBcommon 1.8.0
+      fi && package XKBcommon 1.8.0 ; } &&
     compile LibInput 1.26.2 && package LibInput 1.26.2 &&
     compile LibXKBfile 1.1.3 && package LibXKBfile 1.1.3 &&
     compile LibXcvt 0.1.2 && package LibXcvt 0.1.2 &&
     compile EGLExternalPlatform 1.2.1 && package EGLExternalPlatform 1.2.1 &&
     compile EGL-Wayland 1.1.9 && package EGL-Wayland 1.1.9 &&
+    compile EGL-Wayland2 1.0.2 && package EGL-Wayland2 1.0.2 &&
     compile Scdoc 1.11.3 && package Scdoc 1.11.3 &&
     compile SeatD 0.6.4 && package SeatD 0.6.4 &&
     compile XorgProto 2024.1 && package XorgProto 2024.1 &&
-    compile LibDrm 2.4.121 && package LibDrm 2.4.121 &&
+    compile LibDrm 2.4.121 && package LibDrm 2.4.121
+}
+
+# ---------------------------------------------------------------------------
+# Sway compositor + its wlroots clients. SEPARATE from the Wayland core libs;
+# nothing else in the build depends on this, so it only runs when the user
+# explicitly selects the sway component.
+# ---------------------------------------------------------------------------
+step_sway() {
+    #  XWayland must be built BEFORE Wlroots so that wlroots' 'auto' xwayland
+    #    feature finds the 'Xwayland' binary at its own build time;
+    #  Sway last: needs the whole stack + scdoc (man pages);
+    #  wlr-protocols needs wayland-scanner for its 'check' target; wlr-randr and
+    #    wayland-utils build after the core stack (scdoc optional for wlr-randr).
+    if [ -d /mnt/repo/Recipes/wayland-core ]
+    then for r in XWayland Wlroots Wlr-Protocols Wayland-Utils Wlr-Randr
+         do [ -d "/mnt/repo/Recipes/wayland-core/$r" ] || continue
+            rm -rf "Recipes/$r"
+            cp -a "/mnt/repo/Recipes/wayland-core/$r" "Recipes/$r"
+         done
+    fi
+    if [ -d /mnt/repo/Recipes/Sway-core ]
+    then for r in Sway SwayBg SwayIdle SwayLock
+         do [ -d "/mnt/repo/Recipes/Sway-core/$r" ] || continue
+            rm -rf "Recipes/$r"
+            cp -a "/mnt/repo/Recipes/Sway-core/$r" "Recipes/$r"
+         done
+    fi
+    step_waylandcore &&
     compile XWayland 24.1.2 && package XWayland 24.1.2 &&
-    compile Wlroots 0.15.1 && package Wlroots 0.15.1 &&
+    compile Wlroots 0.20.2 && package Wlroots 0.20.2 &&
     compile Sway 1.7 && package Sway 1.7 &&
     compile Wlr-Protocols a741f0a && package Wlr-Protocols a741f0a &&
     compile Wayland-Utils 1.3.0 && package Wayland-Utils 1.3.0 &&
     compile Wlr-Randr 0.5.0 && package Wlr-Randr 0.5.0
 }
 
+# Back-compat alias: `wayland` builds the core libs AND the Sway compositor.
+step_wayland() {
+    step_waylandcore
+}
+
+
 # Sway ecosystem tools not shipped inside the sway 1.7 tarball (separate
 # upstream projects): swaybg (wallpaper), swaylock (lock screen - the default
 # config's $mod+Escape binding), swayidle (idle/dpms), libdecor (wayland
 # window decorations for SDL2). All four only need the wayland stack (each
 # vendors its protocol XML or uses wayland-protocols' staging tree - no
-# wlr-protocols build dep), so they sort after step_wayland. Recipes are
-# synced fresh from the repo each run (same as step_pantheon); the archive
-# staging in step_sync pulls the four tarballs from $B.
+# wlr-protocols build dep), so they sort after the Wayland core libs. Recipes
+# are synced fresh from the repo each run (same as step_pantheon).
 step_swayextras() {
-    step_sync &&
-    step_tools &&
+    if [ -d /mnt/repo/Recipes/Sway-core ]
+    then for r in SwayBg SwayLock SwayIdle LibDecor
+         do [ -d "/mnt/repo/Recipes/Sway-core/$r" ] || continue
+            rm -rf "Recipes/$r"
+            cp -a "/mnt/repo/Recipes/Sway-core/$r" "Recipes/$r"
+         done
+    fi
+    if [ -d /mnt/repo/Recipes/LibDecor ]
+    then rm -rf Recipes/LibDecor
+         cp -a /mnt/repo/Recipes/LibDecor Recipes/LibDecor
+    fi
+    step_waylandcore &&
     compile SwayBg 1.2.2 && package SwayBg 1.2.2 &&
     compile SwayLock 1.8.6 && package SwayLock 1.8.6 &&
     compile SwayIdle 1.9.0 && package SwayIdle 1.9.0 &&
@@ -883,13 +1207,18 @@ step_swayextras() {
 
 step_vulkan() {
     # Vulkan-Tools' vulkaninfo hard-requires wayland-client when the Wayland
-    # WSI is enabled (its default), and the loader should match: build the
-    # Wayland stack first so a standalone `vulkan` run is self-sufficient.
-    step_wayland &&
+    # WSI is enabled (its default), and the loader should match: build only the
+    # Wayland CORE libraries first (NOT the Sway compositor - a Vulkan build must
+    # never drag in a desktop environment the user may not want).
+    # Vulkan-Intel (Arch split pkg of mesa) supplies the Intel Vulkan ICD that
+    # our `-Dvulkan-drivers=[]` Mesa build omits; it is a manifest recipe, so it
+    # has no build deps beyond the libs already in the tree.
+    step_waylandcore &&
     step_cmake &&
     compile Vulkan-Headers 1.4.357.0 && package Vulkan-Headers 1.4.357.0 &&
     compile Vulkan-Loader 1.4.357.0  && package Vulkan-Loader 1.4.357.0 &&
-    compile Vulkan-Tools 1.4.357.0   && package Vulkan-Tools 1.4.357.0
+    compile Vulkan-Tools 1.4.357.0   && package Vulkan-Tools 1.4.357.0 &&
+    compile Vulkan-Intel 25.3.5      && package Vulkan-Intel 25.3.5
 }
 step_steam() {
     # RenPy 8.5.3 is a prebuilt SDK manifest (bundles its own CPython/SDL2), so
@@ -1015,6 +1344,7 @@ step_ffxiv() {
     # This step is a separate optional component from `gaming`; in the interactive
     # menu the default follows .build-select (currently ffxiv=yes).
     ensure_xivlauncher_archive &&
+    ensure_ffxiv_layout &&
     compile FFXIVQuickLauncher 7.0.20 && package FFXIVQuickLauncher 7.0.20
 }
 
@@ -1241,6 +1571,35 @@ ensure_xivlauncher_archive() {
     fi
 }
 
+ensure_ffxiv_layout() {
+    # The FFXIVQuickLauncher package shipped before the 2026-10-07 recipe was
+    # the LEGACY layout: payload under lib/xivlauncher/ and the original wrapper
+    # (APP="$DIR/lib/xivlauncher/XIVLauncher.exe", no XL_WINEONLINUX), plus the
+    # old Resources/Dependencies without the Dotnet-* family.  BOTH compile()
+    # and package() skip when Packages/<pkg>.tar.bz2 already exists, so that
+    # stale package would never be rebuilt and the Velopack-layout fix (see
+    # XIVLAUNCHER-ISO-REBUILD.md) would never reach the ISO.
+    #
+    # Detect an installed tree that is NOT the current recipe's output (missing
+    # velopack/app-<ver>/XIVLauncher.exe, or the wrapper lacks XL_WINEONLINUX,
+    # or a leftover lib/xivlauncher/) and clear BOTH the tarball and the tree so
+    # the next compile() does a clean `Compile --batch` from the recipe -- whose
+    # pre_install pre-applies velopack/ + writes the fixed wrapper.  Idempotent:
+    # a correctly-built tree is left untouched.
+    local prog=FFXIVQuickLauncher ver=7.0.20
+    local tree="/Programs/$prog/$ver" fresh=0
+    if [ -f "$tree/velopack/app-$ver/XIVLauncher.exe" ] \
+       && grep -q 'XL_WINEONLINUX' "$tree/bin/xivlauncher" 2>/dev/null \
+       && [ ! -e "$tree/lib/xivlauncher" ]; then
+        fresh=1
+    fi
+    if [ "$fresh" -eq 0 ]; then
+        log "FFXIVQuickLauncher $ver: stale/mislaid layout -- clearing tarball + tree for a clean rebuild"
+        rm -f "$B/Packages/$prog--$ver--x86_64.tar.bz2"
+        rm -rf "$tree"
+    fi
+}
+
 ensure_gnome_desktop_legacy() {
     # gnome-settings-daemon 48.1 links the GTK3-era gnome-desktop-3.0 API
     # (meson: dependency 'gnome-desktop-3.0' >= 3.37.1), so Gnome-Desktop 44.5
@@ -1334,6 +1693,74 @@ step_v() {
     compile V 0.5.2 && package V 0.5.2
 }
 
+step_dotnet() {
+    # .NET via Microsoft's official binary tarballs (builds.dotnet.microsoft.com)
+    # -- Arch extra builds dotnet from source; the AUR dotnet-core-bin route
+    # (single combined SDK tarball, split into host/sdk/targeting-pack) is what
+    # these manifest recipes mirror. Dotnet-Sdk (10.0, current LTS) is built
+    # LAST so its muxer wins /System/Index/bin/dotnet. These are pure binary
+    # installs: no compilation, ~2.5 GB unpacked on the ISO (SDKs dominate).
+    # The Alien-Dotnet plugin (/System/Aliens/Dotnet) uses `dotnet` for
+    # `Alien --install Dotnet:<pkg>` -> `dotnet add package`.
+    # NOTE: Gobo requires ProperCase recipe names (NamingConventions), so the
+    # dirs are Dotnet-Host, Dotnet-Sdk-6.0 etc. -- all-lowercase names fail the
+    # Compile naming-convention check. rm BOTH casings: Find_Recipe matches
+    # case-insensitively (ls | grep -i), so a stale lowercase dir left behind
+    # next to its ProperCase twin matches twice and the recipe lookup dies.
+    rm -rf Recipes/[Dd]otnet-*
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Host Recipes/Dotnet-Host
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Runtime Recipes/Dotnet-Runtime
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Targeting-Pack Recipes/Dotnet-Targeting-Pack
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Sdk-6.0 Recipes/Dotnet-Sdk-6.0
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Sdk-8.0 Recipes/Dotnet-Sdk-8.0
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Sdk-9.0 Recipes/Dotnet-Sdk-9.0
+    cp -a /mnt/repo/Recipes/Programming/Dotnet-Sdk Recipes/Dotnet-Sdk
+    # Purge failed-install markers from a prior attempt (root-owned leftovers
+    # like /Programs/Dotnet-Host/10.0.12-failed; mirrors the Lutris/WebKit
+    # pre-clean pattern) so a rerun starts clean. Good installs are kept.
+    rm -rf /Programs/Dotnet-*/*-failed
+    compile Dotnet-Host 10.0.12 && package Dotnet-Host 10.0.12 &&
+    compile Dotnet-Runtime 10.0.12 && package Dotnet-Runtime 10.0.12 &&
+    compile Dotnet-Targeting-Pack 10.0.12 && package Dotnet-Targeting-Pack 10.0.12 &&
+    compile Dotnet-Sdk-6.0 6.0.428 && package Dotnet-Sdk-6.0 6.0.428 &&
+    compile Dotnet-Sdk-8.0 8.0.425 && package Dotnet-Sdk-8.0 8.0.425 &&
+    compile Dotnet-Sdk-9.0 9.0.318 && package Dotnet-Sdk-9.0 9.0.318 &&
+    compile Dotnet-Sdk 10.0.401 && package Dotnet-Sdk 10.0.401
+}
+
+step_opencode() {
+    # Opencode-bin 1.18.35: the "main opencode terminal" AI coding agent CLI,
+    # mirroring the Arch AUR package 'opencode-bin' (its PKGBUILD sets
+    # options=('!strip') -- Compile's do_strip tears the embedded payload out
+    # of these prebuilt single-file executables, leaving a bare-Bun binary).
+    # Optional 'opencode' component, default off.
+    # Source = https://github.com/anomalyco/opencode/releases/download/v1.18.35/
+    #          opencode-linux-x64.tar.gz   (sha256 c8f888b4... == AUR 1.18.35-1)
+    # post_install guards --version == 1.18.35 AND md5 == 12ef0c43....
+    # --no-strip is MANDATORY (see above).
+    rm -rf Recipes/Opencode-bin
+    cp -a /mnt/repo/Recipes/AI/Opencode-bin Recipes/Opencode-bin
+    compile Opencode-bin 1.18.35 --no-strip && package Opencode-bin 1.18.35
+}
+
+step_claude() {
+    # Claude Desktop 2.26454.2 from Anthropic's apt .deb payload (Electron
+    # tree + --no-sandbox launcher; menu entry/icons as unmanaged files).
+    # Optional 'claude' component, default off in the menu.
+    rm -rf Recipes/Claude-Desktop
+    cp -a /mnt/repo/Recipes/AI/Claude-Desktop Recipes/Claude-Desktop
+    compile Claude-Desktop 2.26454.2 && package Claude-Desktop 2.26454.2
+}
+
+step_ollama() {
+    # Ollama 0.34.0 local LLM runtime (bin/ollama + lib/ollama backends with
+    # bundled CUDA 12/13; 1.34 GB archive / ~1.2 GB extra on the ISO).
+    # Optional 'ollama' component, default off in the menu.
+    rm -rf Recipes/Ollama
+    cp -a /mnt/repo/Recipes/AI/Ollama Recipes/Ollama
+    compile Ollama 0.34.0 && package Ollama 0.34.0
+}
+
 step_extras() {
     # Discord is a self-updating desktop bootstrap binary and is NOT part of
     # the shared core. Bubblewrap moved into step_core (Flatpak backend) and
@@ -1383,20 +1810,26 @@ step_core() {
     # options (bit us with Fwupd's introspection flag).
     step_sync &&
     step_tools &&
+    ensure_resolver_compat &&
+    ensure_glib_header_compat &&
     compile PCRE2 10.47 && package PCRE2 10.47 &&
     # GLib bootstrap: pass 1 without introspection (no GI tooling yet) ->
     # GObject-Introspection 1.84 against it -> pass 2 WITH introspection so
     # glib emits its own .gir/.typelibs. Pass 1 must be a FRESH install (wipe
     # any leftover tree + stale index symlinks) or Pre_Installation_Preparation
-    # dangles them mid-install. Pass 2 uses compile_keep: --keep leaves the
-    # pass-1 tree live so g-ir-scanner can load libgirepository during the
-    # build, and the install overlays the introspection files onto it.
+    # dangles them mid-install. Pass 2 must be a FORCED in-place rebuild
+    # (compile_forced, --keep): compile_keep would short-circuit on
+    # installed() and skip, repackaging pass-1's non-introspected tree.
+    # --keep leaves the pass-1 tree live so g-ir-scanner can load
+    # libgirepository during the build, and the install overlays the
+    # introspection files onto it.
     # Idempotent: both flatpak and pantheon call step_core, so skip the full
     # wipe+rebuild once an introspection-enabled GLib tarball already exists
-    # (Gio typelib present), keeping the "built exactly once" promise.
+    # (Gio typelib present; GLib 2.84 installs typelibs into girepository-1.0),
+    # keeping the "built exactly once" promise.
     if [ -f "$B/Packages/GLib--2.84.4--x86_64.tar.bz2" ] &&
        tar -tjf "$B/Packages/GLib--2.84.4--x86_64.tar.bz2" 2>/dev/null |
-           grep -q 'lib/girepository/Gio-2.0'
+           grep -q 'Gio-2.0.typelib'
     then
         log "GLib 2.84.4 introspection tarball present; skipping two-pass rebuild"
         compile GObject-Introspection 1.84.0 && package GObject-Introspection 1.84.0
@@ -1407,7 +1840,7 @@ step_core() {
         GLIB_INTROSPECTION=disabled compile GLib 2.84.4 && package GLib 2.84.4 &&
         compile GObject-Introspection 1.84.0 && package GObject-Introspection 1.84.0 &&
         rm -f "$B/Packages/GLib--2.84.4--x86_64.tar.bz2" &&
-        GLIB_INTROSPECTION=enabled compile_keep GLib 2.84.4 && package GLib 2.84.4
+        GLIB_INTROSPECTION=enabled compile_forced GLib 2.84.4 && package GLib 2.84.4
     fi &&
     # GdkPixbuf: flatpak's flatpak-validate-icon libexec helper links
     # gdk-pixbuf-2.0 UNCONDITIONALLY (meson.build), so it must pre-exist on
@@ -1505,6 +1938,84 @@ step_sddm() {
     compile SDDM 0.20.0 && package SDDM 0.20.0
 }
 
+# ---------------------------------------------------------------------------
+# Mesa graphics stack as a STANDALONE step (no Pantheon desktop required).
+#   sudo ./run-build.sh mesa
+# builds, in order: python-mako -> LibGLVnd -> LLVM (with clang) -> the CLC
+# toolchain (SPIRV-Headers -> SPIRV-Tools -> SPIRV-LLVM-Translator -> LibCLc)
+# -> Mesa (forced in-place rebuild). step_pantheon calls step_mesa_build too,
+# so both paths share one build order and never diverge.
+# Assumes the base ISO already provides Mesa's system deps (LibDrm, Wayland,
+# Wayland-Protocols, the X libraries, zlib, expat) -- this step only layers the
+# upgraded graphics stack on top.
+step_mesa_build() {
+    compile LibGLVnd 1.7.0 && package LibGLVnd 1.7.0 &&
+    compile LLVM 19.1.7 && package LLVM 19.1.7 &&
+    # --- Mesa CLC toolchain (iris -> with_clc), strict order: -------------
+    # Mesa's meson.build:828 lists iris in with_driver_using_cl, so with_clc
+    # turns true and meson.build:851 makes dependency('libclc') REQUIRED.
+    # src/compiler/clc additionally links libclang-cpp (built by the LLVM
+    # recipe above), LLVMSPIRVLib and SPIRV-Tools. Build order is fixed:
+    #   SPIRV-Headers (headers) -> SPIRV-Tools (libSPIRV-Tools.pc) ->
+    #   SPIRV-LLVM-Translator (LLVMSPIRVLib.pc + bin/llvm-spirv) -> LibCLc
+    #   (libclc.pc + spirv{,-64}-mesa3d-.spv).
+    # Without this chain the ILD fails "Dependency libclc not found" and
+    # Mesa falls back to software rendering (glitches) on real GPUs.
+    # Conditional on iris still being in the recipe: the Plan B fallback drops
+    # iris (see Mesa-CLC-Fallback-Plans.md), which makes CLC unnecessary -- and
+    # LibCLc would fail without clang -- so skip the chain entirely then.
+    if grep -q 'gallium-drivers=.*iris' /Data/Compile/Recipes/Mesa/25.3.6/Recipe 2>/dev/null
+    then
+        compile SPIRV-Headers 1.4.304.1 && package SPIRV-Headers 1.4.304.1 &&
+        compile SPIRV-Tools 2024.4 && package SPIRV-Tools 2024.4 &&
+        compile SPIRV-LLVM-Translator 19.1.7 && package SPIRV-LLVM-Translator 19.1.7 &&
+        compile LibCLc 19.1.7 && package LibCLc 19.1.7
+    else
+        log "Mesa recipe has no iris: skipping SPIRV/LibCLc chain (no CLC)"
+    fi &&
+    # Mesa is built from the current recipe (no packaged() skip): the recipe
+    # can change driver scope (e.g. the virtio gallium driver for the QEMU/KVM
+    # build VM), and there's no recipe-hash tracking in the compile stack --
+    # packaged() only checks the tarball's existence, so an edited recipe would
+    # otherwise orphan a stale build. Drop the tarball and rebuild IN PLACE via
+    # compile_keep (--keep). Do NOT rm -rf the program tree: that leaves no
+    # /System/Index/lib/dri, so mesa's sandboxed install tries to create it
+    # fresh in the UnionSandbox overlay and reliably dies ENOENT during the
+    # libdril_dri.so copy. Keeping the existing tree lets Pre_Installation_
+    # Preparation/--keep relocate the prior lib/dri, and install succeeds.
+    rm -f "$B/Packages/Mesa--25.3.6--x86_64.tar.bz2" &&
+    compile_keep Mesa 25.3.6 && package Mesa 25.3.6
+}
+
+step_mesa() {
+    step_sync &&
+    if python3 -c "import mako" >/dev/null 2>&1
+    then log "python-mako already present (Mesa build-time dep)"
+    else log "Installing python-mako via Alien PIP (Mesa build-time dep)"
+         Alien --install PIP:mako || return 1
+    fi &&
+    # One-time LLVM migration guard. The CLC path needs clang, which the
+    # previously-installed LLVM 19.1.7 was NOT built with (the recipe has since
+    # gained -DLLVM_ENABLE_PROJECTS=clang). Rebuilding LLVM is expensive, so
+    # refuse early with instructions instead of failing deep inside Mesa. Only
+    # applies while iris (and therefore CLC) is in the Mesa recipe.
+    if grep -q 'gallium-drivers=.*iris' /Data/Compile/Recipes/Mesa/25.3.6/Recipe 2>/dev/null &&
+       [ ! -e /Programs/LLVM/19.1.7/lib/libclang-cpp.so ]
+    then
+        log "!! LLVM 19.1.7 has no libclang-cpp.so (built without clang)."
+        log "!! Run the one-time LLVM rebuild first; see Mesa-CLC-Toolchain.md,"
+        log "!! section \"One-time LLVM rebuild\" (wipe the LLVM recipe + program"
+        log "!! tree + tarball, then:  sudo ./run-build.sh pkg LLVM 19.1.7 )."
+        return 1
+    fi &&
+    # Force Mesa to rebuild even when a 25.3.6 tree is already installed
+    # (compile_keep short-circuits on installed()). Keep the tree: its
+    # lib/dri relocation is what stops the sandboxed install dying ENOENT.
+    { [ -d /Programs/Mesa/25.3.6 ] && touch /Programs/Mesa/25.3.6-failed || :; } &&
+    step_mesa_build &&
+    rm -f /Programs/Mesa/25.3.6-failed
+}
+
 step_pantheon() {
     # elementary OS 8 Pantheon desktop stack. Order is a topo sort of the
     # GNOME 48 foundation + session stack + elementary recipes; each recipe's
@@ -1537,7 +2048,7 @@ step_pantheon() {
     compile Fribidi 1.0.16 && package Fribidi 1.0.16 &&
     compile FreeType 2.13.3 && package FreeType 2.13.3 &&
     compile Fontconfig 2.15.0 && package Fontconfig 2.15.0 &&
-    compile Pixman 0.44.2 && package Pixman 0.44.2 &&
+    compile Pixman 0.46.4 && package Pixman 0.46.4 &&
     compile Cairo 1.18.4 && package Cairo 1.18.4 &&
     # Pango rebuilt in place (--keep): a 1.56.1 tree already exists, so plain
     # compile's Pre_Installation_Preparation safe-copy dangles /usr/include/
@@ -1601,20 +2112,9 @@ step_pantheon() {
     # (Linux-Headers + PAM symlink + Elogind + its BootUp wiring live in
     # step_elogind_base, invoked from step_core above, since SDDM + Flatpak
     # need the same seat/session foundation.)
-    compile LibGLVnd 1.7.0 && package LibGLVnd 1.7.0 &&
-    compile LLVM 19.1.7 && package LLVM 19.1.7 &&
-    # Mesa is built from the current recipe (no packaged() skip): the recipe
-    # can change driver scope (e.g. the virtio gallium driver for the QEMU/KVM
-    # build VM), and there's no recipe-hash tracking in the compile stack --
-    # packaged() only checks the tarball's existence, so an edited recipe would
-    # otherwise orphan a stale build. Drop the tarball and rebuild IN PLACE via
-    # compile_keep (--keep). Do NOT rm -rf the program tree: that leaves no
-    # /System/Index/lib/dri, so mesa's sandboxed install tries to create it
-    # fresh in the UnionSandbox overlay and reliably dies ENOENT during the
-    # libdril_dri.so copy. Keeping the existing tree lets Pre_Installation_
-    # Preparation/--keep relocate the prior lib/dri, and install succeeds.
-    rm -f "$B/Packages/Mesa--25.3.6--x86_64.tar.bz2" &&
-    compile_keep Mesa 25.3.6 && package Mesa 25.3.6 &&
+    # Mesa + its CLC toolchain live in step_mesa_build so `run mesa` can build
+    # the graphics stack without the rest of the Pantheon desktop.
+    step_mesa_build &&
     compile LibPipewire 1.4.0 && package LibPipewire 1.4.0 &&
     compile LibCanberra 0.30 && package LibCanberra 0.30 &&
     # (LibGudev built earlier — see comment above the Libwacom compile.)
@@ -1730,6 +2230,15 @@ step_pantheon() {
     # via gst-libav against the ISO's FFmpeg 4.2.2).
     compile Gst-Plugins-Good 1.26.1 && package Gst-Plugins-Good 1.26.1 &&
     compile Gst-LibAV 1.26.1 && package Gst-LibAV 1.26.1 &&
+    # Gst-Plugins-Bad/Ugly 1.26.1: the long tail the SDDM theme KCM and
+    # QtWebEngine probe for. Bad carries the extra demux/mux/filter set
+    # (mpegts, mxf, rtp/sdp, dvd/vob sub, videoconvert chain, mse for
+    # Chromium-backed QtWebEngine); Ugly carries the legacy patent-adjacent
+    # demuxers (asf, realmedia, dvdsub, dvdlpcm, mpeg2dec). Everything
+    # needing an absent library is explicitly disabled in the recipes, so
+    # neither one can fail on a missing dependency.
+    compile Gst-Plugins-Bad 1.26.1 && package Gst-Plugins-Bad 1.26.1 &&
+    compile Gst-Plugins-Ugly 1.26.1 && package Gst-Plugins-Ugly 1.26.1 &&
     # VTE (gtk4): PantheonTerminal 8.1.0 (dependency('vte-2.91-gtk4')).
     compile VTE 0.80.1 && package VTE 0.80.1 &&
     # libportal: PantheonScreenshot (libportal-gtk4) + PantheonFiles (libportal-gtk3).
@@ -1984,7 +2493,7 @@ step_webkit() {
     compile Fribidi 1.0.16 && package Fribidi 1.0.16 &&
     compile FreeType 2.13.3 && package FreeType 2.13.3 &&
     compile Fontconfig 2.15.0 && package Fontconfig 2.15.0 &&
-    compile Pixman 0.44.2 && package Pixman 0.44.2 &&
+    compile Pixman 0.46.4 && package Pixman 0.46.4 &&
     compile Cairo 1.18.4 && package Cairo 1.18.4 &&
     # Pango: must ship its own Pango-1.0.gir/PangoCairo-1.0.gir (GTK+ 3.24.43's
     # introspection emits Gtk-3.0.gir including them).
@@ -2149,11 +2658,22 @@ merge_qml_index() {
     # is a Qt6 tree.  Also mirror plugin symlinks (`-type l`) so module .so
     # entries whose program dir stores them as links are not silently dropped.
     [ -d /Programs ] || return 0
+    # A previous layout stored the KF6 qml trees under $PROG/lib/qml; the
+    # current recipes install them at $PROG/qml.  That left stale Index links
+    # (org/kde/config -> .../lib/qml/org/kde/config) DANGLING, so plain mkdir/
+    # ln fail with EEXIST/ENOENT every re-run.  Drop any link whose target is
+    # gone before (re)creating entries, and never source a /Current/ tree (it
+    # resolves to the same files as the versioned one -> ln "are the same file").
+    find /System/Index/qml -xtype l -delete 2>/dev/null || :
+    find /System/Index/lib/qml -xtype l -delete 2>/dev/null || :
     for root in /System/Index/qml /System/Index/lib/qml; do
         mkdir -p "$root"
         for prog in /Programs/*/*/qml /Programs/*/*/lib/qml; do
             [ -d "$prog" ] || continue
-            case "$prog" in /Programs/Qt/*/qml) continue ;; esac
+            case "$prog" in
+                /Programs/Qt/*/qml) continue ;;
+                */Current/qml|*/Current/lib/qml) continue ;;
+            esac
             ( cd "$prog" && find . -mindepth 1 \( -type d -o -type f -o -type l \) -print0 ) | \
                 while IFS= read -r -d "" p; do
                     p="${p#./}"
@@ -2280,6 +2800,15 @@ step_plasma() {
     # KF6CoreAddons.
     compile KIO 6.26.0 && package KIO 6.26.0 &&
     compile KParts 6.26.0 && package KParts 6.26.0 &&
+    # Polkit-Qt-1 0.201.1 (Qt6 polkit bindings) MUST be built BEFORE KAuth:
+    # KAuth's backend selection probes find_package(PolkitQt6-1). Built
+    # without it, KAuth silently compiles the FAKE backend -> no
+    # kauth_backend_plugin.so -> every KAuth::Action fails at runtime with
+    # "The backend does not specify how to authorize" (the SDDM-KCM theme
+    # install bug, fixed 2026-10-08; see SDDM-THEME-INSTALL-FIX.md §3.6).
+    # KAuth's polkit-1 backend also links KF6::WindowSystem (built above).
+    # Only Qt6 Core/Gui/DBus + polkit-gobject are needed, all already present.
+    compile Polkit-Qt-1 0.201.1 && package Polkit-Qt-1 0.201.1 &&
     compile KAuth 6.26.0 && package KAuth 6.26.0 &&
     compile KTextEditor 6.26.0 && package KTextEditor 6.26.0 &&
     compile KPTY 6.26.0 && package KPTY 6.26.0 &&
@@ -2290,6 +2819,14 @@ step_plasma() {
     # Qt6 Core/Network, so build it right here for KNewStuff's REQUIRED find.
     compile Attica 6.26.0 && package Attica 6.26.0 &&
     compile KNewStuff 6.26.0 && package KNewStuff 6.26.0 &&
+    # FrameworkIntegration (Tier 3 KF6): ships kpackagehandlers/knshandler,
+    # the binary kpackage runs to resolve+install Global Theme KNS
+    # dependencies (colorscheme/plasmatheme/etc). Without it every theme with
+    # a dependency fails with "Could not install dependency: 'kns://...'".
+    # Also builds the KDE platform theme + kstyle integration plugins. Deps on
+    # the KF6Config/KColorScheme/KIconThemes/KNotifications/KWidgetsAddons set
+    # (plus NewStuffCore/KPackage/KI18n for the handlers), all present above.
+    compile FrameworkIntegration 6.26.0 && package FrameworkIntegration 6.26.0 &&
     # ---- Phase D: Gear 26.08.0 (Dolphin + Konsole). Both are plain Qt6/KF6
     # consumers (no Plasma deps) needing the Tier 2 KF6 above (Dolphin: kio,
     # kparts, kfilemetadata, kitemviews, kconfigwidgets, kservice, kdoctools,
@@ -2340,7 +2877,6 @@ step_plasma() {
     compile KQuickCharts 6.26.0 && package KQuickCharts 6.26.0 &&
     compile KWallet 6.26.0 && package KWallet 6.26.0 &&
     compile KDED 6.26.0 && package KDED 6.26.0 &&
-    compile Polkit-Qt-1 0.201.1 && package Polkit-Qt-1 0.201.1 &&
     # LMDB is REQUIRED by Baloo; plain-Makefile lib using -C override recipe
     compile LMDB 0.9.31 && package LMDB 0.9.31 &&
     # baloo pulls in kfilemetadata + kidletime (both above); needs kio first
@@ -2421,10 +2957,30 @@ step_plasma() {
     compile Milou 6.7.4 && package Milou 6.7.4 &&
     compile KGamma 6.7.4 && package KGamma 6.7.4 &&
     compile Breeze 6.7.4 && package Breeze 6.7.4 &&
+    # Aurorae 6.7.4: window-decoration ENGINE for KWin (KWin 6 ships no
+    # engines). Provides the org.kde.kdecoration3 rendering plugin so themes
+    # downloaded via "Get New Window Decorations" actually render. Deps
+    # (KDecoration3/KF6/Qt6) are all built above; ship its own aurorae.knsrc
+    # (alias window-decorations + autoconfig provider + plasma-apply-aurorae).
+    # No theme content is baked -- only the renderer.
+    compile Aurorae 6.7.4 && package Aurorae 6.7.4 &&
     compile Plasma-Integration 6.7.4 && package Plasma-Integration 6.7.4 &&
     compile Powerdevil 6.7.4 && package Powerdevil 6.7.4 &&
     compile Polkit-KDE-Agent-1 6.7.4 && package Polkit-KDE-Agent-1 6.7.4 &&
     compile Systemsettings 6.7.4 && package Systemsettings 6.7.4 &&
+    # SDDM-KCM adds the "Login Screen (SDDM)" page to systemsettings (Colors &
+    # Themes) with theme preview + "Get New Login Screens" (KNewStuff/OCS via
+    # sddmtheme.knsrc). Deps (KF6 KAuth/KIO/Archive/NewStuff/KCMUtils/Service +
+    # Qt6 Quick/QuickWidgets) all sit earlier in the stack; must land after
+    # Systemsettings. kcm_sddm.{so,qml} -> lib/plugins/plasma/kcms/systemsettings,
+    # kcmsddm_authhelper -> lib/kf6/kauth (D-Bus polkit action).
+    # install_kcmsddm_policy + install_kcmsddm_dbusconf are NOT optional here:
+    # kauth_install_actions() generates the polkit .policy + dbus system.d
+    # .conf at build time (neither ships in the upstream tarball) -- drop them
+    # and theme install fails with "The backend does not specify how to
+    # authorize" (no policy) and "not allowed to own the service" (no dbus
+    # name-ownership conf).
+    compile SDDM-KCM 6.7.4 && install_kcmsddm_policy && install_kcmsddm_dbusconf && package SDDM-KCM 6.7.4 &&
     compile Kinfocenter 6.7.4 && package Kinfocenter 6.7.4 &&
     compile KMenuEdit 6.7.4 && package KMenuEdit 6.7.4 &&
     # KDeplasma-Addons DROPPED: requires find_package(Corrosion REQUIRED)
@@ -2449,12 +3005,140 @@ step_plasma() {
 # on it. refresh-merge.py installs the package into work/rootfs with
 # `SymlinkProgram -c overwrite`, re-pointing /System/Index/lib/libc.so.6 etc.
 # to 2.44 in the shipped image. Idempotent (compile/package skip when present).
+# Glibc 2.44-2's install-time SymlinkProgram -c overwrite flips the live
+# /System/Index/lib SONAME links (libc.so.6, ld-linux-x86-64.so.2, ...) to the
+# 2.44-2 tree. But compile() SKIPS once the Glibc tarball exists, so a re-run
+# never re-links them -- and the base 2.30 links (or a stale re-link) leave the
+# chroot running libc 2.30 while newly built programs (GLib 2.84.4 and anything
+# loading it) need GLIBC_2.32/2.34, killing host tools like kcmdesktopfilegenerator
+# during the merge's Plasma-Desktop rebuild. Force the re-point unconditionally.
+ensure_glibc_runtime_index() {
+    local rt=/Programs/Glibc/2.44-2/lib
+    [ -f "$rt/libc.so.6" ] || { log "WARN: $rt missing, cannot re-point runtime libc"; return 0; }
+    local l
+    for l in \
+        ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 \
+        librt.so.1 libthread_db.so.1 libutil.so.1 libanl.so.1 \
+        libBrokenLocale.so.1 libmvec.so.1 libcrypt.so.1 \
+        libnss_compat.so.2 libnss_dns.so.2 libnss_files.so.2 \
+        libnss_hesiod.so.2 libnss_db.so.2
+    do
+        [ -e "$rt/$l" ] || continue
+        ln -sf "$rt/$l" "/System/Index/lib/$l"
+    done
+    ln -sf "$rt/ld-linux-x86-64.so.2" /System/Index/lib64/ld-linux-x86-64.so.2
+    ln -sf "$rt/libc.so.6" /System/Index/lib64/libc.so.6
+    # Remove leftover 2.30 index entries: Gobo's SymlinkProgram runs ldconfig
+    # after every install and re-points the SONAME links above at these stale
+    # files, silently undoing the re-point. With no 2.30 candidate left, ldconfig
+    # has nothing to flip to. Purge by TARGET (any name), then restore the
+    # libthread_db-1.0.so versioned name ldconfig prefers for libthread_db.
+    local f
+    for f in /System/Index/lib/*; do
+        [ -L "$f" ] || continue
+        case "$(readlink -f "$f" 2>/dev/null)" in
+            /Programs/Glibc/2.30/*) rm -f "$f";;
+        esac
+    done
+    ln -sf "$rt/libthread_db-1.0.so" /System/Index/lib/libthread_db-1.0.so
+    log "OK: live chroot runtime libc re-pointed to 2.44-2"
+}
+
 ensure_glibc244() {
     cd /Data/Compile
     rm -rf Recipes/Glibc
     cp -a /mnt/repo/Recipes/Glibc Recipes/Glibc
     compile Glibc 2.44-2 && package Glibc 2.44-2 || return 1
+    ensure_glibc_runtime_index || return 1
+    ensure_resolver_compat || return 1
     log "OK: glibc upgraded to 2.44-2 (index now resolves to it)"
+}
+
+# glib < 2.85 probes res_query() by linking `-lresolv`. Our gcc only ever finds
+# the resolver through the glibc Program tree, and the 2.44-2 tree's
+# libresolv.so.2 is the post-2.34 EMPTY compat stub (resolver merged into libc
+# there, which exports only __res_query@GLIBC_2.2.5 NON-default -- glib's
+# unversioned reference can bind ONLY a default export, so the probe dies with
+# "undefined reference to '__res_query'"). The base 2.30 tree still carries the
+# real resolver (__res_query@@GLIBC_2.2.5 default). Copy it over the 2.44-2 stub
+# under the SAME SONAME (libresolv.so.2; ABI-stable, needs only GLIBC_2.14) and
+# point the index at it. Idempotent -- safe to run in step_core and again after
+# a glibc compile/merge restores the stub.
+ensure_resolver_compat() {
+    local real=/Programs/Glibc/2.30/lib/libresolv-2.30.so
+    [ -f "$real" ] || { log "WARN: $real missing, skipping resolver compat"; return 0; }
+    cp -f "$real" /Programs/Glibc/2.44-2/lib/libresolv.so.2 &&
+    chmod 755 /Programs/Glibc/2.44-2/lib/libresolv.so.2 &&
+    ln -sf /Programs/Glibc/2.44-2/lib/libresolv.so.2 /System/Index/lib/libresolv.so.2 &&
+    ln -sf /Programs/Glibc/2.44-2/lib/libresolv.so.2 /System/Index/lib/libresolv.so &&
+    log "OK: real resolver installed as Glibc 2.44-2 libresolv.so.2"
+}
+
+# The glibc 2.44-2 overlay upgraded only the RUNTIME, not the dev headers
+# (2.30-era set), so meson's link-only has_function() checks pass for
+# C23 functions whose DECLS are missing; glib then calls them undeclared.
+# Handled durably in the GLib recipe's pre_build hook (re-runs after every
+# Compile unpack). This function is only a safety net for ad-hoc runs that
+# patch a stale tree -- it will be wiped by the next unpack. Kept idempotent.
+ensure_glib_header_compat() {
+    local m=/Data/Compile/Sources/glib-2.84.4/meson.build
+    [ -f "$m" ] || return 0
+    sed -i -e "/^[[:space:]]*'free_aligned_sized',$/d" \
+           -e "/^[[:space:]]*'free_sized',$/d" \
+           -e "/^[[:space:]]*'close_range',$/d" \
+           -e "s/glibconfig_conf.set('G_HAVE_FREE_SIZED', have_func_free_sized)/glibconfig_conf.set('G_HAVE_FREE_SIZED', false)/" \
+           -e "s/if cc.has_function('strlcpy')/if false/" "$m"
+    return 0
+}
+
+# Same for the MERGED image: refresh-merge.py rebuilds work/rootfs from the
+# glibc tarball (empty stub restored, index -> 2.44), so re-apply the real
+# resolver content + a working index link there. The ISO has no 2.30 tree, so
+# source the resolver from the chroot's own Program tree.
+# The merge extracts the shipped ISO's rootfs (work/rootfs) fresh from the base
+# ISO, whose /System/Index/lib still carries the 2.30 versioned entries. Each
+# package install runs SymlinkProgram -> ldconfig, which re-points the glibc
+# SONAME links back at those 2.30 files, silently undoing the 2.44-2 upgrade in
+# the SHIPPED image. Re-point + purge host-side here (running ln inside that
+# chroot is what crashes with _dl_call_libc_early_init, so do it as plain host
+# filesystem ops on the extracted rootfs).
+ensure_iso_glibc_runtime() {
+    local w="$B/work/rootfs"
+    local rt=/Programs/Glibc/2.44-2/lib
+    [ -f "$w$rt/libc.so.6" ] || return 0
+    local l changed=0 purged=0 f
+    for l in \
+        ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 \
+        librt.so.1 libthread_db.so.1 libutil.so.1 libanl.so.1 \
+        libBrokenLocale.so.1 libmvec.so.1 libcrypt.so.1 libresolv.so.2 \
+        libnss_compat.so.2 libnss_dns.so.2 libnss_files.so.2 \
+        libnss_hesiod.so.2 libnss_db.so.2
+    do
+        [ -e "$w$rt/$l" ] || continue
+        ln -sf "$rt/$l" "$w/System/Index/lib/$l"
+        changed=$((changed+1))
+    done
+    for f in "$w/System/Index/lib"/*; do
+        [ -L "$f" ] || continue
+        case "$(readlink -f "$f" 2>/dev/null)" in
+            /Programs/Glibc/2.30/*)
+                rm -f "$f"
+                purged=$((purged+1));;
+        esac
+    done
+    ln -sf "$rt/libthread_db-1.0.so" "$w/System/Index/lib/libthread_db-1.0.so"
+    log "OK: ISO glibc runtime re-pointed ($changed links) + purged $purged stale 2.30 index entries"
+}
+
+ensure_resolver_iso() {
+    local w="$B/work/rootfs"
+    local real=/Programs/Glibc/2.30/lib/libresolv-2.30.so
+    [ -f "$real" ] && [ -d "$w/Programs/Glibc/2.44-2/lib" ] || return 0
+    cp -f "$real" "$w/Programs/Glibc/2.44-2/lib/libresolv.so.2" &&
+    chmod 755 "$w/Programs/Glibc/2.44-2/lib/libresolv.so.2" &&
+    ln -sf /Programs/Glibc/2.44-2/lib/libresolv.so.2 "$w/System/Index/lib/libresolv.so.2" &&
+    ln -sf /Programs/Glibc/2.44-2/lib/libresolv.so.2 "$w/System/Index/lib/libresolv.so" &&
+    log "OK: ISO resolver + index baked into work/rootfs"
 }
 
 # ProtonPlus 0.6.8 repack: the first build's --appimage-extract came out EMPTY
@@ -2519,15 +3203,566 @@ ensure_sdl_kcm() {
     log "OK: Plasma-Desktop 6.7.4 rebuilt with the Game Controller KCM"
 }
 
-# The three ISO runtime repairs that must be baked by the NEXT merge: the glibc
-# 2.44-2 upgrade (unblocks FastFetch + ProtonPlus on the booted ISO), the
-# ProtonPlus repack (its previous tarball had an empty lib/protonplus) and the
-# SDL 2.30.2 upgrade + plasma-desktop gamecontroller KCM rebuild. Called
-# by step_merge BEFORE refresh-merge.py and by the standalone `livefix` step.
+# rEFInd 0.14.2 (prebuilt EFI bootloader). The installer's GRUB/rEFInd chooser
+# (zfs47 livefix) needs /Programs/Refind/Current present at install time, so the
+# package must exist in Packages/ before the merge. Standalone prebuilt binary
+# (no toolchain/Plasma deps), so it builds standalone. Built on demand; skips
+# once the tarball carries the refind tree. Called by ensure_livefix_builds, so
+# both `merge` and the standalone `livefix` ship it.
+ensure_refind() {
+    cd /Data/Compile
+    if tar tjf "$B/Packages/Refind--0.14.2--x86_64.tar.bz2" 2>/dev/null | grep -q 'share/refind'
+    then
+        log "SKIP: Refind 0.14.2 package already present"
+        return 0
+    fi
+    # Sync the recipe into the chroot (step_sync's Refind loop only runs on a
+    # full `sync` step; this makes merge/livefix self-contained).
+    rm -rf Recipes/Refind
+    cp -a /mnt/repo/Recipes/Refind Recipes/Refind
+    compile Refind 0.14.2 && package Refind 0.14.2 || return 1
+    log "OK: Refind 0.14.2 built + packaged"
+}
+
+# ---------------------------------------------------------------------------
+# SDDM-KCM polkit action -- the "Unable to install theme" bug.
+#
+# sddmthemeinstaller and the SDDM settings module escalate through
+# KAuth::Action, which needs a polkit policy registered before it can ask for
+# authorization. That policy is NOT in the upstream tarball: KDE generates it at
+# install time from kcm_sddm.actions via kauth_install_actions()
+# (sddm-kcm CMakeLists.txt:42). On this ISO the macro produced nothing -- the
+# install log has
+#     -- Installing: /usr/libexec/kf6/kauth/kcmsddm_authhelper
+# but no matching policy line, and the file is absent from the program tree,
+# from the package tarball and from the index farm.
+#
+# With no policy registered, KAuth aborts with
+#     The backend does not specify how to authorize
+# BEFORE it ever shows a password prompt, so the KCM reports "Unable to
+# install theme" and sddmthemeinstaller exits 255. The helper binary and the
+# D-Bus service file are both present, which is why it looks like a
+# permissions/agent problem and is not one.
+#
+# So generate the policy ourselves from kcm_sddm.actions and drop it in the
+# PROGRAM tree rather than the overlay. /usr/share/polkit-1/actions is a symlink
+# to /System/Index, so anything written there dies on reboot; putting it under
+# /Programs/SDDM-KCM/6.7.4/share/polkit-1/actions means CreatePackage captures
+# it and the index farm links it into place on every boot.
+# ---------------------------------------------------------------------------
+
+# Emit a polkit .policy from a KDE .actions file -- a faithful stand-in for
+# kauth_install_actions()/kauth-policy-gen, verified byte-repeatable against
+# the real generator's output (/usr/lib/kf6/kauth/kauth-policy-gen). Key facts
+# from that reference:
+#   * <description> comes from the short `Name[..]` keys, <message> from the
+#     long `Description[..]` keys (a KDE .actions file only ever has those two
+#     keys plus Policy=). Both are emitted per-language with the lang code
+#     taken from the [..] bracket (NOT by chopping a fixed prefix -- the code
+#     starts at byte 13, right after "Description[").
+#   * kauth-policy-gen filters a language whitelist: sr@latin/sr@ijekavian*,
+#     ca@valencia, ast are produced by .po->.actions conversion but dropped
+#     from the policy. Actions are emitted in alphabetical order.
+#   * [Domain] Name / URL / Icon become <vendor> / <vendor_url> / <icon_name>.
+#   * <defaults> is allow_inactive=no + allow_active=<Policy> only -- NO
+#     <allow_any> and NO <annotate>. The KAuth helper is dispatched through
+#     the explicit helper id (setHelperId) + its D-Bus service file, not via
+#     an annotate key (the genuine upstream policy has none).
+gen_kcmsddm_policy() {
+    local actions="$1" prefix="$2" helper="$3"
+    awk -v PREFIX="$prefix" -v HELPER="$helper" '
+    # Escape & FIRST, otherwise the entities we just inserted get re-escaped.
+    function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+    BEGIN {
+        # kauth-policy-gen language whitelist, taken from its observed output.
+        W["ar"]=W["az"]=W["bg"]=W["bs"]=W["ca"]=W["cs"]=W["da"]=W["de"]=1
+        W["el"]=W["en_GB"]=W["eo"]=W["es"]=W["et"]=W["eu"]=W["fi"]=W["fr"]=1
+        W["gl"]=W["he"]=W["hu"]=W["ia"]=W["id"]=W["is"]=W["it"]=W["ja"]=1
+        W["ka"]=W["ko"]=W["lt"]=W["lv"]=W["nb"]=W["nl"]=W["nn"]=W["pa"]=1
+        W["pl"]=W["pt"]=W["pt_BR"]=W["ro"]=W["ru"]=W["sa"]=W["sk"]=W["sl"]=1
+        W["sr"]=W["sv"]=W["ta"]=W["tr"]=W["uk"]=W["zh_CN"]=W["zh_TW"]=1
+        print "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        print "<!DOCTYPE policyconfig PUBLIC"
+        print " \"-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN\""
+        print " \"http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd\">"
+        print "<policyconfig>"
+    }
+    function addorder(l) { if (l in seen) return; seen[l] = 1; langlist[++norder] = l }
+    function emitSection(sec,   p, i, a, m, lt, first) {
+        if (!(sec in pol)) return
+        p = pol[sec]
+        printf "   <action id=\"%s\">\n", sec
+        for (i = 1; i <= norder; i++) {
+            lt = langlist[i]
+            a = sec SUBSEP "D" lt
+            if (a in v) printf "      <description xml:lang=\"%s\">%s</description>\n", lt, esc(v[a])
+        }
+        a = sec SUBSEP "D"
+        if (a in v) printf "      <description>%s</description>\n", esc(v[a])
+        for (i = 1; i <= norder; i++) {
+            lt = langlist[i]
+            m = sec SUBSEP "M" lt
+            if (m in v) printf "      <message xml:lang=\"%s\">%s</message>\n", lt, esc(v[m])
+        }
+        m = sec SUBSEP "M"
+        if (m in v) printf "      <message>%s</message>\n", esc(v[m])
+        printf "      <defaults>\n"
+        printf "         <allow_inactive>no</allow_inactive>\n"
+        printf "         <allow_active>%s</allow_active>\n", p
+        printf "      </defaults>\n"
+        printf "   </action>\n"
+        print ""
+    }
+    /^\[/ { sec = substr($0, 2, length($0) - 2); next }
+    sec == "Domain" {
+        if      ($0 ~ /^Name=/)        vendor = substr($0, 6)
+        else if ($0 ~ /^URL=/)         vurl   = substr($0, 5)
+        else if ($0 ~ /^Icon=/)        icon   = substr($0, 6)
+        else if ($0 ~ /^Name\[/) {
+            l = substr($0, 6, index($0, "]") - 6)
+            if (l in W) addorder(l)
+        }
+        next
+    }
+    /^Name\[/ {
+        l = substr($0, 6, index($0, "]") - 6)
+        if (l in W) {
+            addorder(l)
+            v[sec SUBSEP "D" l] = substr($0, index($0, "=") + 1)
+        }
+        next
+    }
+    /^Name=/ { v[sec SUBSEP "D"] = substr($0, 6); next }
+    sec != "" && /^Description\[/ {
+        l = substr($0, 13, index($0, "]") - 13)   # code starts at byte 13
+        if (l in W) v[sec SUBSEP "M" l] = substr($0, index($0, "=") + 1)
+        next
+    }
+    sec != "" && /^Description=/ { v[sec SUBSEP "M"] = substr($0, 13); next }
+    /^Policy=/ { pol[sec] = substr($0, 8); next }
+    END {
+        print "<vendor>" vendor "</vendor>"
+        print "<vendor_url>" vurl "</vendor_url>"
+        print "<icon_name>" icon "</icon_name>"
+        # Actions in alphabetical order (kauth-policy-gen sorts them).
+        for (a in pol) acts[++na] = a
+        for (i = 1; i <= na; i++)
+            for (j = i + 1; j <= na; j++)
+                if (acts[j] < acts[i]) { t = acts[i]; acts[i] = acts[j]; acts[j] = t }
+        for (i = 1; i <= na; i++) emitSection(acts[i])
+        print "</policyconfig>"
+    }
+    ' "$actions"
+}
+
+# Generate the policy into the program tree. Idempotent. If the already-built
+# package lacks the policy, drops the stale tarball so the caller's package()
+# regenerates it -- that is what makes an existing build pick the fix up.
+install_kcmsddm_policy() {
+    local prog=SDDM-KCM ver=6.7.4
+    local prefix=org.kde.kcontrol.kcmsddm helper=kcmsddm_authhelper
+    local tarball="$B/Packages/$prog--$ver--x86_64.tar.bz2"
+    local dest="/Programs/$prog/$ver/share/polkit-1/actions/$prefix.policy"
+    local actions="" cand t want got
+
+    # Source tree still unpacked: use it directly.
+    for cand in /Data/Compile/Sources/sddm-kcm-$ver/kcm_sddm.actions \
+                /Data/Compile/sddm-kcm-$ver/kcm_sddm.actions; do
+        [ -f "$cand" ] && { actions="$cand"; break; }
+    done
+    # Cleaned after a build: fall back to the cached tarball. Gobo keeps
+    # downloads in /Data/Compile/Archives, unpacked trees in
+    # /Data/Compile/Sources.
+    if [ -z "$actions" ]; then
+        for t in /Data/Compile/Archives/sddm-kcm-$ver.tar.* \
+                 /Data/Compile/Sources/sddm-kcm-$ver.tar.*; do
+            [ -f "$t" ] || continue
+            rm -rf /tmp/kcmsddm-pol; mkdir -p /tmp/kcmsddm-pol
+            tar xf "$t" -C /tmp/kcmsddm-pol "sddm-kcm-$ver/kcm_sddm.actions" 2>/dev/null
+            [ -f "/tmp/kcmsddm-pol/sddm-kcm-$ver/kcm_sddm.actions" ] &&
+                { actions="/tmp/kcmsddm-pol/sddm-kcm-$ver/kcm_sddm.actions"; break; }
+        done
+    fi
+    if [ -z "$actions" ]; then
+        log "WARN: kcm_sddm.actions not found -- cannot generate $prefix.policy"
+        log "      (installing an SDDM theme will fail with 'does not specify how to authorize')"
+        return 0
+    fi
+    if [ ! -d "/Programs/$prog/$ver" ]; then
+        log "SKIP: $prog $ver not installed yet; polkit action added at package time"
+        return 0
+    fi
+
+    # Every action in the .actions file must appear in the policy, or polkitd
+    # would register a partial set and KAuth would fail on the missing ones.
+    want=$(grep -c '^\[org\.' "$actions")
+    mkdir -p "${dest%/*}"
+    gen_kcmsddm_policy "$actions" "$prefix" "$helper" > "$dest" || {
+        log "FAILED: could not write $dest"; rm -f "$dest"; return 1; }
+    got=$(grep -c '<action id=' "$dest")
+    # Genuine kauth-policy-gen emits NO <annotate> and no <allow_any>; validate
+    # against that shape (correct count, defaults, close tags).
+    if [ "$got" -ne "$want" ] \
+       || ! grep -q '<allow_inactive>no</allow_inactive>' "$dest" \
+       || ! grep -q '<allow_active>auth_admin</allow_active>' "$dest" \
+       || grep -q '<annotate' "$dest" \
+       || ! grep -q '</policyconfig>' "$dest"; then
+        log "FAILED: generated policy is incomplete ($got/$want actions, defaults/close tag missing)"
+        rm -f "$dest"; return 1
+    fi
+    log "OK: generated $prefix.policy ($got actions) -> /Programs/$prog/$ver/share/polkit-1/actions/"
+
+    if [ -f "$tarball" ] && ! tar tjf "$tarball" 2>/dev/null | grep -q "$prefix.policy"; then
+        rm -f "$tarball"
+        log "     existing SDDM-KCM tarball had no policy -- repackaging"
+    fi
+}
+
+# SDDM-KCM 6.7.4: the D-Bus half of the SDDM theme-install fix (2026-10-08).
+# kauth_install_actions() also generates <name>.conf (DBus system policy) so a
+# root helper may own its bus name; like the polkit .policy this file is NOT in
+# the upstream tarball and the old packaging dropped it.  The system bus reads
+# /System/Settings/dbus-1/system.d (Gobo settings farm; system.conf includedir),
+# NOT /{{,usr/}}share/dbus-1 -- so emit the conf into the program tree (baked
+# into the package by CreatePackage) and apply-live-fixes.sh block 13e mirrors
+# it into Program Settings + /System/Settings/dbus-1/system.d.  Without it every
+# KAuth 6 activation dies with "not allowed to own the service
+# org.kde.kcontrol.kcmsddm" (Launch helper exited with unknown return code 255).
+install_kcmsddm_dbusconf() {
+    local prog=SDDM-KCM ver=6.7.4
+    local prefix=org.kde.kcontrol.kcmsddm helper=kcmsddm_authhelper
+    local tarball="$B/Packages/$prog--$ver--x86_64.tar.bz2"
+    local dest="/Programs/$prog/$ver/share/dbus-1/system.d/$prefix.conf"
+
+    if [ ! -d "/Programs/$prog/$ver" ]; then
+        log "SKIP: $prog $ver not installed yet; dbus conf added at package time"
+        return 0
+    fi
+    mkdir -p "${dest%/*}"
+    cat > "$dest" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE busconfig PUBLIC
+ "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <!-- Only root can own the $prefix helper name (default policy denies own="*") -->
+  <policy user="root">
+    <allow own="$prefix"/>
+  </policy>
+  <policy context="default">
+    <allow send_destination="$prefix"/>
+  </policy>
+</busconfig>
+EOF
+    if grep -q '<allow own="' "$dest" && grep -q "$prefix" "$dest"; then
+        log "OK: generated $prefix.conf -> /Programs/$prog/$ver/share/dbus-1/system.d/"
+    else
+        log "FAILED: could not write $dest"; rm -f "$dest"; return 1
+    fi
+
+    if [ -f "$tarball" ] && ! tar tjf "$tarball" 2>/dev/null | grep -q "$prefix.conf"; then
+        rm -f "$tarball"
+        log "     existing SDDM-KCM tarball had no dbus conf -- repackaging"
+    fi
+}
+
+# SDDM-KCM 6.7.4: the "Login Screen (SDDM)" page in systemsettings. Built in
+# step_plasma's chain, but a bare `merge`/`livefix` must ship it too, so build
+# it on demand. It links against the installed Plasma stack (Systemsettings,
+# KF6 NewStuff/KCMUtils, Qt6 Quick); if plasma was never built in this chroot
+# there is nothing to build against, so skip with a warning rather than failing
+# merge/livefix (SDDM-KCM is only meaningful on a Plasma ISO). Called by
+# ensure_livefix_builds, so both `merge` and the standalone `livefix` ship it.
+ensure_sddm_kcm() {
+    cd /Data/Compile
+    # Always stage the recipe: install_kcmsddm_policy needs nothing from it, but
+    # a forced rebuild below does.
+    rm -rf Recipes/SDDM-KCM
+    cp -a /mnt/repo/Recipes/Plasma6-core/SDDM-KCM Recipes/SDDM-KCM
+    if tar tjf "$B/Packages/SDDM-KCM--6.7.4--x86_64.tar.bz2" 2>/dev/null | grep -q 'kcm_sddm.so'
+    then
+        log "SKIP: SDDM-KCM 6.7.4 package already present"
+    else
+        if ! installed Systemsettings 6.7.4
+        then
+            log "SKIP: SDDM-KCM (Systemsettings 6.7.4 not installed - build 'plasma' first)"
+            return 0
+        fi
+        if installed SDDM-KCM 6.7.4
+        then compile_forced SDDM-KCM 6.7.4 || return 1
+        else compile SDDM-KCM 6.7.4 || return 1
+        fi
+    fi
+    # Unconditional: kauth_install_actions() emitted no policy, so an already
+    # built SDDM-KCM still cannot install themes. This is idempotent and drops
+    # a policy-less tarball so package() below regenerates it.
+    install_kcmsddm_policy || return 1
+    # Same for the D-Bus half: without org.kde.kcontrol.kcmsddm.conf the root
+    # helper cannot own its bus name (Launch helper exited 255).
+    install_kcmsddm_dbusconf || return 1
+    package SDDM-KCM 6.7.4 || return 1
+    log "OK: SDDM-KCM 6.7.4 built + packaged"
+}
+
+# PyQt5 5.15.11: the Qt bindings the installer's GUI wizard (qtwizard.py,
+# GraphicalTail.py) needs. The base ISO shipped a pip PyQt5 under
+# System/Aliens/PIP/3.8 with a sip.cpython-38 runtime -- built for CPython 3.8
+# only -- while python3 on this CD is 3.11.12. Every `from PyQt5 import ...`
+# died with ModuleNotFoundError: No module named 'PyQt5.sip', and the bare
+# `except:` in GoboLinuxInstaller turned that into a silent curses downgrade.
+# The recipe installs the abi3 bindings + a cp311 sip into a real program tree
+# and drops a .pth so plain `python3` finds it. No Qt of its own: the bindings
+# link the CD's existing Qt 5.15.2 through /System/Index/lib (verified: every
+# libQt5* NEEDED resolves there), so this adds ~8 MB, not ~68 MB.
+# Built on demand and skipped once the tarball carries the tree. Called by
+# ensure_livefix_builds, so both `merge` and the standalone `livefix` ship it.
+step_fzf() {
+    # fzf 0.74.4 -- the general-purpose fuzzy finder used by the shell
+    # integrations and handy on the console. Built FROM SOURCE with the ISO's
+    # Go toolchain (fzf's own installer downloads a prebuilt binary, which is
+    # not reproducible for an ISO). Needs step_go first: /Programs/Go/1.27.1
+    # must be installed before the recipe's pre_install() calls `go build`.
+    step_sync &&
+    step_go &&
+    rm -rf Recipes/Fzf
+    cp -a /mnt/repo/Recipes/Programming/Fzf Recipes/Fzf
+    compile Fzf 0.74.4 && package Fzf 0.74.4
+}
+
+step_html5lib() {
+    # html5lib 1.1 (+ its pure-python deps six and webencodings) -- required by
+    # QtWebEngine's configure, which runs
+    #     /System/Index/bin/python3.11 -c "import html5lib"
+    # and refuses to build the module without it ("Python3 html5lib is
+    # missing"). Chromium's HTML tokenizer generator imports it during the build
+    # as well. Installed into /System/Index site-packages, so it lands in the
+    # index symlink farm for the running system too.
+    step_sync
+    # Compile's Find_Recipe greps TOP-LEVEL recipe dirs case-insensitively, so a
+    # leftover lowercase 'html5lib' dir from the pre-rename run aliases
+    # 'HTML5Lib' and the lookup fails with "Could not find a recipe for HTML5Lib"
+    # (while still listing both spellings as "Did you mean one of these?").
+    # Purge BOTH spellings before copying, same as step_appimage does for
+    # LibAppimage/libappimage.
+    { rm -rf Recipes/HTML5Lib Recipes/html5lib &&
+      cp -a /mnt/repo/Recipes/Python/HTML5Lib Recipes/HTML5Lib; } &&
+    compile HTML5Lib 1.1 && package HTML5Lib 1.1
+}
+
+step_qtwebengine() {
+    # QtWebEngine 6.10.3 -- the Chromium-backed web engine.
+    #
+    # Needed by SDDM's theme-preview pane (sddm-kcm loads themes into a
+    # QWebEngineView) and by Plasma's WebEngine-backed surfaces.
+    #
+    # THIS IS THE HEAVIEST RECIPE IN THE ISO: an 881 MB tarball containing the
+    # full Chromium source (134.0.6998.208, patched to 146.0.7680.164) that
+    # must be compiled with GN+make. Expect hours and 15-25 GB of scratch in
+    # /Data/Compile/Sources. It is deliberately NOT part of step_plasma,
+    # step_all or step_livefix -- you opt in explicitly.
+    #
+    # The recipe builds with QtBase's `qt-configure-module` (QtWebEngine's
+    # CMakeLists.txt does NOT run configure.cmake itself) and asks for the
+    # "Unix Makefiles" generator because this chroot has no Ninja.
+    # step_plasma first: QtBase + the Qt6 module trees are the configure-time
+    # dependency, and they must already be installed.
+    # step_html5lib first: configure hard-fails without an importable html5lib.
+    step_sync &&
+    step_plasma &&
+    step_html5lib &&
+    compile QtWebEngine 6.10.3 && package QtWebEngine 6.10.3
+}
+
+# Everything the SDDM theme-install path needs beyond the polkit policy that
+# ensure_sddm_kcm already installs. Run this after 'plasma'; it is NOT wired
+# into 'all'/'livefix' because of the Chromium build weight above.
+step_sddmdeps() {
+    step_fzf &&
+    step_qtwebengine
+}
+
+ensure_pyqt5() {
+    cd /Data/Compile
+    if tar tjf "$B/Packages/PyQt5--5.15.11--x86_64.tar.bz2" 2>/dev/null | grep -q 'PyQt5/QtCore.abi3.so'
+    then
+        log "SKIP: PyQt5 5.15.11 package already present"
+        return 0
+    fi
+    rm -rf Recipes/PyQt5
+    cp -a /mnt/repo/Recipes/PyQt5 Recipes/PyQt5
+    compile PyQt5 5.15.11 && package PyQt5 5.15.11 || return 1
+    log "OK: PyQt5 5.15.11 built + packaged"
+}
+
+# PyQt6 6.10.0: what the installer GUI is ported to. Pinned to 6.10.x, not the
+# newer 6.11.x, because PyQt6 minor versions track Qt minor versions and the CD
+# ships QtBase 6.10.3 -- so 6.10.x is the release whose ABI matches the Qt
+# already present (libQt6Core/Gui/Widgets/DBus + the xcb plugin are all already
+# in /Programs/QtBase/6.10.3 and exported via /System/Index/lib). Like PyQt5,
+# no bundled PyQt6-Qt6 wheel: ~39 MB instead of ~123 MB, and no second private
+# Qt6 to mix with the KF6 apps. qtcompat.py prefers PyQt6 and falls back to
+# PyQt5, so this is an upgrade, not a dependency -- but a GUI-only ISO wants it.
+ensure_pyqt6() {
+    cd /Data/Compile
+    if tar tjf "$B/Packages/PyQt6--6.10.0--x86_64.tar.bz2" 2>/dev/null | grep -q 'PyQt6/QtCore.abi3.so'
+    then
+        log "SKIP: PyQt6 6.10.0 package already present"
+        return 0
+    fi
+    if ! installed QtBase 6.10.3
+    then
+        log "SKIP: PyQt6 (QtBase 6.10.3 not installed - build 'plasma' first)"
+        return 0
+    fi
+    rm -rf Recipes/PyQt6
+    cp -a /mnt/repo/Recipes/PyQt6 Recipes/PyQt6
+    compile PyQt6 6.10.0 && package PyQt6 6.10.0 || return 1
+    log "OK: PyQt6 6.10.0 built + packaged"
+}
+
+# Mesa owns lib/dri/ -- i.e. the GPU drivers the desktop actually renders with.
+# Its recipe scopes them through meson_variables (gallium-drivers), so a
+# driver-scope edit only reaches the image if Mesa is recompiled and
+# repackaged. step_pantheon does that, but neither step_merge nor a bare
+# `livefix` ever calls step_pantheon, so an edited recipe would be silently
+# ignored and the ISO would keep shipping the previous driver set -- which is
+# how a laptop with Intel graphics can boot all the way to SDDM and then show a
+# black screen: i915 binds and gives a real DRM device, but with no iris in
+# lib/dri/ nothing can drive it and the Qt/OpenGL greeter never comes up. The
+# QEMU/KVM build VM hides this because virgl covers virtio_gpu, so the gap only
+# appears on real hardware. The compile stack has no recipe-hash tracking
+# (packaged() only checks that the tarball exists), so rebuild whenever the
+# recipe is NEWER than the packaged tarball and no-op otherwise.
+ensure_mesa() {
+    cd /Data/Compile || return 1
+    local recipe="/mnt/repo/Recipes/mesa-core/Mesa/25.3.6/Recipe"
+    local tarball="$B/Packages/Mesa--25.3.6--x86_64.tar.bz2"
+    [ -f "$recipe" ] || { log "SKIP: no Mesa recipe at $recipe"; return 0; }
+    # When Intel was picked in the auto-driver prompt, iris must actually be in
+    # the recipe. Fail loudly instead of quietly producing another ISO with no
+    # Intel GL driver -- that is the exact failure that boots to a black SDDM.
+    if [ "${AUTODRIVER_CHOICE:-}" = intel ]
+    then
+        grep -q 'gallium-drivers=[^[:space:]]*iris' "$recipe" || {
+            log "ERROR: auto-driver 'intel' selected, but the Mesa recipe does not enable iris"
+            return 1
+        }
+    fi
+    # The recipe being newer than the tarball is NOT a sufficient rebuild
+    # trigger. The recipe was edited to add iris on 2026-10-03 20:33 and a
+    # "rebuild" ran at 20:42 -- but compile_keep() SKIPPED the compile (Mesa
+    # 25.3.6 was already installed) and just re-packaged the PREVIOUS (Sep 5,
+    # no-iris) tree, yielding a byte-identical tarball. Net result: the ISO
+    # still ships no iris_dri.so, the Intel iGPU only has llvmpipe, and KWin
+    # composites in software (the flashing white-box artifacts). So require the
+    # iris driver to actually be present before treating Mesa as up to date.
+    local iris_ok=0
+    [ -e "/Programs/Mesa/25.3.6/lib/dri/iris_dri.so" ] && iris_ok=1
+    if [ -f "$tarball" ] && [ -z "$(find "$recipe" -newer "$tarball" 2>/dev/null)" ] \
+       && [ "$iris_ok" = 1 ]; then
+        log "SKIP: Mesa 25.3.6 package is up to date with its recipe (iris present)"
+        return 0
+    fi
+    if [ "$iris_ok" = 0 ]; then
+        log "Mesa install is missing iris_dri.so -- forcing a clean rebuild"
+    else
+        log "Mesa recipe is newer than the packaged tarball -- rebuilding (GPU driver scope changed)"
+    fi
+    # step_pantheon's sync loop only runs on a full `sync`; copy the recipe
+    # ourselves so merge/livefix stay self-contained (same as ensure_refind).
+    rm -rf Recipes/Mesa
+    cp -a /mnt/repo/Recipes/mesa-core/Mesa Recipes/Mesa
+    # radeonsi drives its JIT through LLVM and meson requires LLVM >= 18.0.0,
+    # so that package has to exist before Mesa is configured.
+    if ! tar tjf "$B/Packages/LLVM--19.1.7--x86_64.tar.bz2" >/dev/null 2>&1; then
+        log "LLVM 19.1.7 package missing -- building it before Mesa"
+        rm -rf Recipes/LLVM
+        cp -a /mnt/repo/Recipes/Pantheon/LLVM Recipes/LLVM
+        compile LLVM 19.1.7 && package LLVM 19.1.7 || return 1
+    fi
+    # meson's build dir ($sourcedir/_build) is created once and then reused on
+    # every --keep rebuild: bin/Compile only "mkdir -p"'s it and do_build runs
+    # `meson setup SOURCEDIR ... _build` against the EXISTING dir, which meson
+    # treats as already-configured and does NOT re-apply changed -D options.
+    # That is exactly how the iris entry added to meson_variables never reached
+    # the compiler. Wipe it so the rebuild reconfigures from scratch.
+    rm -rf /Data/Compile/Sources/mesa-25.3.6/_build
+    # Drop the tarball and rebuild IN PLACE (--keep). Use compile_forced, NOT
+    # compile_keep: Mesa 25.3.6 is already installed, so compile_keep would
+    # SKIP the compile and merely re-package the stale tree (the 2026-10-03
+    # bug). --keep itself is required -- it preserves the live program tree so
+    # Mesa's sandboxed install finds /System/Index/lib/dri. Do NOT rm -rf the
+    # program tree: that leaves no /System/Index/lib/dri and the sandbox install
+    # dies ENOENT during the libdril_dri.so copy.
+    rm -f "$tarball" &&
+    compile_forced Mesa 25.3.6 && package Mesa 25.3.6 || return 1
+    # Prove the rebuild actually produced the Intel driver. A gallium driver
+    # that was not compiled leaves an "iris: driver missing" stub inside
+    # libgallium and no lib/dri/iris_dri.so; if that slips through the ISO
+    # silently composites on llvmpipe again.
+    if [ -e "/Programs/Mesa/25.3.6/lib/dri/iris_dri.so" ]; then
+        log "OK: Mesa 25.3.6 rebuilt + packaged (iris_dri.so present)"
+    else
+        log "ERROR: Mesa rebuilt without lib/dri/iris_dri.so -- check $B/logs/Mesa.log (meson 'gallium-drivers' must list iris)"
+        return 1
+    fi
+}
+
+# The ISO runtime repairs that must be baked by the NEXT merge: the glibc 2.44-2
+# upgrade (unblocks FastFetch + ProtonPlus on the booted ISO), the ProtonPlus
+# repack (its previous tarball had an empty lib/protonplus), the SDL 2.30.2
+# upgrade + plasma-desktop gamecontroller KCM rebuild, the rEFInd bootloader
+# package (installer chooser), the SDDM-KCM login-screen page, the PyQt5 + PyQt6
+# bindings the installer GUI needs, and the Mesa GPU driver rebuild. Called by
+# step_merge BEFORE refresh-merge.py AND by the standalone `livefix` step, so
+# merge and livefix stay in lock-step with no gap -- a recipe edit lands in the
+# image from one `run-build.sh livefix` with no separate `pantheon` step.
+# NVIDIA Settings launcher + icon. The recipe installs them into the
+# program's share/ dir (share/applications + share/pixmaps) because that is
+# the only dir SymlinkProgram links into /System/Index/share, i.e. the only
+# way the launcher reaches /usr/share/applications and the icon reaches
+# /usr/share/pixmaps (where the "Icon=nvidia-settings" key is resolved from).
+# The previous layout used a "Shared/" dir, which Gobo ignores entirely: the
+# ISO then ships NO NVIDIA Settings launcher and the entry that does exist
+# has no icon. Rebuild the program when the installed tree still carries the
+# old layout, so the merge ships the fix without a separate build step.
+ensure_nvidia_settings() {
+    cd /Data/Compile
+    local desktop="/Programs/Nvidia-Settings/Current/share/applications/nvidia-settings.desktop"
+    local icon="/Programs/Nvidia-Settings/Current/share/pixmaps/nvidia-settings.png"
+    if [ -f "$desktop" ] && [ -f "$icon" ]
+    then
+        log "SKIP: Nvidia-Settings 610.57.04 (share/ launcher + icon already installed)"
+        return 0
+    fi
+    log "Nvidia-Settings: launcher/icon not in share/ -> rebuilding with the new layout"
+    rm -rf Recipes/Nvidia-Settings
+    cp -a /mnt/repo/Recipes/Nvidia/Nvidia-Settings Recipes/Nvidia-Settings
+    rm -f "$B/Packages/Nvidia-Settings--610.57.04--x86_64.tar.bz2"
+    # A same-version rebuild leaves dangling /System/Index symlinks pointing
+    # into the just-deleted tree; the install then opens a *dangling* link ->
+    # ENOENT. Drop them so the install re-creates clean files.
+    rm -rf /Programs/Nvidia-Settings/610.57.04 /Programs/Nvidia-Settings/610.57.04-failed
+    find /System/Index -type l -lname '/Programs/Nvidia-Settings/*' -delete 2>/dev/null || true
+    compile Nvidia-Settings 610.57.04 || return 1
+    package Nvidia-Settings 610.57.04 || return 1
+    [ -f "$desktop" ] && [ -f "$icon" ] || {
+        log "FAILED: NVIDIA Settings launcher/icon still missing after rebuild"
+        return 1
+    }
+    log "OK: NVIDIA Settings launcher + icon installed under share/"
+}
+
 ensure_livefix_builds() {
     ensure_glibc244 || return 1
     ensure_protonplus || return 1
     ensure_sdl_kcm || return 1
+    ensure_refind || return 1
+    ensure_sddm_kcm || return 1
+    ensure_pyqt5 || return 1
+    ensure_pyqt6 || return 1
+    ensure_mesa || return 1
+    ensure_nvidia_settings || return 1
 }
 
 step_merge() {
@@ -2553,11 +3788,25 @@ step_merge() {
         log "FAILED: RefreshLiveCD merge (see $B/logs/refresh.log)"
         return 1
     }
+    # refresh-merge just re-ran ldconfig on every package install against the
+    # base-ISO 2.30 index leftovers, possibly re-flipping the shipped image's
+    # glibc SONAME links back to 2.30. Re-point + purge the ISO rootfs so the
+    # finalize actually ships 2.44-2.
+    ensure_iso_glibc_runtime
+    ensure_resolver_iso
     log "OK: merge complete (work/ ready for ISO finalization)"
     # Hand the build products back to whoever owns the mounted repo (no
     # user-specific owner is hardcoded).
     chown -R --reference="$B" "$B/work" "$B/Packages" "$B/logs" 2>/dev/null || true
-    step_livefix
+    step_livefix || return 1
+    # Alien language plugins + /System/Aliens scaffolds. This used to be a
+    # separate 'aliens' step run *after* merge (it writes into the merged tree,
+    # which merge wipes). Folded in here so a single 'merge' produces a tree
+    # that already carries the Alien-NPM/Cargo/Go/Odin dispatcher plugins in
+    # /System/Index/bin, exactly like the 'all'/'iso' flows. Idempotent, so the
+    # standalone 'aliens' step (and the 'iso' preset that lists it) can still be
+    # run afterwards as a harmless no-op re-apply.
+    step_aliens || return 1
 }
 
 # Runtime fixes that must exist in every ISO but are not (fully) handled by
@@ -2616,7 +3865,7 @@ step_devices() {
     # the live session:
     #
     #   - Libusb 1.0.27        userspace USB access (libusb-1.0.so.0)
-    #   - Libmtp 1.1.21        MTP protocol stack (libmtp.so.9)
+    #   - Libmtp 1.1.23        MTP protocol stack (libmtp.so.9)
     #   - Simple-Mtpfs 0.4.0   FUSE driver that gives /Mount/phone a real
     #                          file tree over MTP (the mountpoint + boot-time
     #                          automount task live in section 43)
@@ -2628,7 +3877,7 @@ step_devices() {
     #                          ensure_gpg_chain below
     #   - GnuPG 2.4.9          gpg / gpgv engine flatpak needs for its GPG
     #                          verification + the phone PGP identity workflow
-    #   - Nvidia-Settings 580.159.04  nvidia-settings/xrandr CLI the NVIDIA
+    #   - Nvidia-Settings 610.57.04  nvidia-settings/xrandr CLI the NVIDIA
     #                          runtime enablement (livefix 14b) exposes under
     #                          Wayland/Xorg
     #
@@ -2638,11 +3887,11 @@ step_devices() {
     # the ISO).
     step_sync
     compile Libusb 1.0.27 && package Libusb 1.0.27 || return 1
-    compile Libmtp 1.1.21 && package Libmtp 1.1.21 || return 1
+    compile Libmtp 1.1.23 && package Libmtp 1.1.23 || return 1
     compile Simple-Mtpfs 0.4.0 && package Simple-Mtpfs 0.4.0 || return 1
     ensure_gpg_chain || return 1
-    compile Nvidia-Settings 580.159.04 && package Nvidia-Settings 580.159.04 || return 1
-    log "OK: phone/MTP package set built (Libusb 1.0.27, Libmtp 1.1.21, Simple-Mtpfs 0.4.0, LibGCrypt 1.11.3, Libksba 1.6.8, GnuPG 2.4.9, Nvidia-Settings 580.159.04). Run 'merge' (apply-live-fixes section 43) to wire the /Mount/phone mount + MtpPhone automount task into the ISO."
+    compile Nvidia-Settings 610.57.04 && package Nvidia-Settings 610.57.04 || return 1
+    log "OK: phone/MTP package set built (Libusb 1.0.27, Libmtp 1.1.23, Simple-Mtpfs 0.4.0, LibGCrypt 1.11.3, Libksba 1.6.8, GnuPG 2.4.9, Nvidia-Settings 610.57.04). Run 'merge' (apply-live-fixes section 43) to wire the /Mount/phone mount + MtpPhone automount task into the ISO."
 }
 
 # GnuPG 2.4.9 build chain repair (phone/PGP tier). The base ISO ships only
@@ -2690,6 +3939,14 @@ step_livefix() {
         log "No $B/work/rootfs yet — run 'merge' first"
         return 1
     }
+    # The tree's /System/Index/share/vulkan/{icd.d,implicit_layer.d,
+    # explicit_layer.d} can be (stale) symlinks into a dead Mesa program dir
+    # -- the base ISO ships them that way -- and the same is true for the
+    # GLVND EGL vendor dir.  In that case the NVIDIA manifests would be
+    # written THROUGH them into that dead program dir and Vulkan/EGL would
+    # see nothing.  apply-live-fixes.sh section 14e/19 now converts those
+    # dirs into real aggregation dirs and links every manifest from the
+    # program that owns it, so no separate script has to run first.
     bash /mnt/gobo-build/apply-live-fixes.sh "$B/work/rootfs" || return 1
     # Hand the tree back to whoever owns the mounted repo (files created by
     # apply-live-fixes.sh -- 14b's /usr/share/applications + pixmaps -- are
@@ -2709,8 +3966,19 @@ step_livefix() {
         prog=${helper%%/*}; rel=${helper#*/}
         pdir=$(readlink -f "$B/work/rootfs/Programs/$prog/Current" 2>/dev/null || true)
         [ -n "$pdir" ] && [ -e "$pdir/$rel" ] || continue
-        chown root:root "$pdir/$rel" 2>/dev/null || true
-        chmod 4755 "$pdir/$rel" 2>/dev/null || true
+        # The D-Bus system bus runs as user "messagebus": the setuid launch
+        # helper must be EXECUTABLE by that user, so it gets group=messagebus
+        # + mode 4750 (root:root makes every User=root service activation fail
+        # with "Failed to execute program <name>: Permission denied").
+        if [ "$prog" = "DBus" ]; then
+            mb_gid=$(awk -F: '$1=="messagebus"{print $3; exit}' "$B/work/rootfs/etc/group" 2>/dev/null)
+            [ -n "$mb_gid" ] || mb_gid=0
+            chown root:"$mb_gid" "$pdir/$rel" 2>/dev/null || true
+            chmod 4750 "$pdir/$rel" 2>/dev/null || true
+        else
+            chown root:root "$pdir/$rel" 2>/dev/null || true
+            chmod 4755 "$pdir/$rel" 2>/dev/null || true
+        fi
         log "setuid re-applied (post-chown): $prog/$rel"
     done
     # polkit agent helper path varies; sweep it, then re-own sudo plug-ins.
@@ -2789,9 +4057,11 @@ SELECT_CORE="proton sync linux nvidia nvdiag glibc32"
 clabel() {
     case "$1" in
         lib32)    echo "32-bit compatibility libraries (Steam/Wine)" ;;
-        wayland)  echo "Wayland core stack + Sway compositor" ;;
+        wayland)  echo "Wayland core libs only (no Sway compositor)" ;;
+        sway)     echo "Sway compositor + wlroots clients (includes Wayland core libs)" ;;
+        waylandcore) echo "Wayland core libs only (no Sway compositor)" ;;
         swayextras) echo "Sway extras (swaybg/swaylock/swayidle/libdecor)" ;;
-        vulkan)   echo "Vulkan loader/headers/tools" ;;
+        vulkan)   echo "Vulkan loader/headers/tools + Intel Vulkan ICD (vulkan-intel)" ;;
         gaming)   echo "Gaming stack (Steam/Wine/Proton/Lutris/Heroic/ProtonPlus)" ;;
         ffxiv)    echo "XIVLauncher (FFXIV Quick Launcher, runs under Wine)" ;;
         lutris)   echo "Lutris game launcher (self-contained: wine stack + webkit, no sway)" ;;
@@ -2799,6 +4069,7 @@ clabel() {
         extras)   echo "Discord + VLC desktop apps" ;;
         flatpak)  echo "Flatpak runtime (desktop-free, CLI + sandboxing)" ;;
         sddm)     echo "SDDM display manager (Wayland greeter)" ;;
+        mesa)     echo "Mesa 3D graphics stack (+ LLVM/clang, SPIR-V CLC chain, LibGLVnd) -- desktop-free" ;;
         pantheon) echo "Pantheon (elementary OS 8) desktop" ;;
         webkit)   echo "WebKitGTK web engine (Lutris/GTK3 account logins)" ;;
         plasma)   echo "Plasma 6.7 desktop (Qt6/KF6/Plasma/Gear)" ;;
@@ -2806,7 +4077,10 @@ clabel() {
         network)  echo "Network tooling (iw NL80211 CLI, ethtool, usb_modeswitch, ModemManager rebuilt with QMI+MBIM backends, BIND dig/host/nslookup)" ;;
         pipewire) echo "PipeWire media server + WirePlumber session manager (system-wide audio)" ;;
         music)    echo "LMMS 1.3.0-alpha.2 music production DAW (Qt5; needs FFTW3F + libsndfile)" ;;
-        programming) echo "Programming languages: Node.js 24 (npm 12.1.0) + Go 1.27 + Odin dev + V 0.5.2" ;;
+        programming) echo "Programming languages: Node.js 24 (npm 12.1.0) + Go 1.27 + Odin dev + V 0.5.2 + .NET (SDKs 6/8/9/10, runtime, host)" ;;
+        opencode)  echo "Opencode-bin AI coding agent CLI (terminal, MIT, AUR 1.18.35)" ;;
+        claude)    echo "Claude Desktop AI assistant (Electron app)" ;;
+        ollama)    echo "Ollama local LLM runtime (1.34 GB archive, NVIDIA CUDA)" ;;
         appimage) echo "AppImage tooling (appimagetool + libappimage)" ;;
         fs)       echo "Filesystem tools (XFS + OpenZFS)" ;;
         iso)      echo "Assemble final ISO + live fixes" ;
@@ -2818,6 +4092,8 @@ csteps() {
     case "$1" in
         lib32)    echo "lib32" ;;
         wayland)  echo "wayland" ;;
+        sway)     echo "sway" ;;
+        waylandcore) echo "waylandcore" ;;
         swayextras) echo "swayextras" ;;
         vulkan)   echo "vulkan" ;;
         gaming)   echo "steam winetools mingw winedev pycompat pyxml protonplus" ;;
@@ -2829,11 +4105,15 @@ csteps() {
         extras)   echo "extras" ;;
         flatpak)  echo "flatpak" ;;
         sddm)     echo "sddm" ;;
+        mesa)     echo "mesa" ;;
         pantheon) echo "pantheon" ;;
         webkit)   echo "webkit" ;;
         plasma)   echo "plasma" ;;
         music)    echo "music" ;;
-        programming) echo "nodejs go odin v" ;;
+        programming) echo "nodejs go odin v dotnet" ;;
+        opencode)  echo "opencode" ;;
+        claude)    echo "claude" ;;
+        ollama)    echo "ollama" ;;
         pipewire) echo "pipewire" ;;
         appimage) echo "appimage" ;;
         fs)       echo "fs" ;;
@@ -2856,8 +4136,8 @@ cdeps() {
 
 # Highest-level step ordering used to flatten a component selection into a
 # single run list (mirrors the 'all' case). Only these appear in the run list.
-SELECT_ORDER="proton sync linux nvidia nvdiag glibc32 fs lib32 wayland swayextras vulkan steam winetools mingw winedev protonplus lutris ffxiv pycompat pyxml flatpak sddm extras fastfetch appimage webkit pantheon plasma pipewire network music nodejs go odin v merge aliens"
-SELECT_ALL="lib32 wayland swayextras vulkan gaming ffxiv lutris fastfetch fs extras flatpak sddm appimage pantheon webkit plasma modem network music programming pipewire iso"
+SELECT_ORDER="proton sync linux nvidia nvdiag glibc32 fs lib32 wayland swayextras vulkan steam winetools mingw winedev protonplus lutris ffxiv pycompat pyxml flatpak sddm extras fastfetch appimage webkit mesa pantheon plasma pipewire network music nodejs go odin v dotnet opencode claude ollama merge aliens"
+SELECT_ALL="lib32 wayland swayextras vulkan gaming ffxiv lutris fastfetch fs extras flatpak sddm appimage mesa pantheon webkit plasma modem network music programming pipewire iso opencode claude ollama"
 
 comp_select_default() { awk -F= -v k="$1" '$1==k{print $2}' "$SELECT_CFG" 2>/dev/null; }
 
@@ -2927,10 +4207,11 @@ menu_select() {
         def="$(comp_select_default "$c")"
         if [ -z "$def" ]; then
             # First-run default: most components default to 'yes'; the heavy
-            # optional extras (music/LMMS, programming languages) default to
-            # 'no' so a quickly-browsed menu never drags in a big build by
+            # optional extras (music/LMMS, programming languages, the AI
+            # recipes -- Ollama alone is a 1.34 GB archive) default to 'no'
+            # so a quickly-browsed menu never drags in a big build by
             # accident.
-            case "$c" in music|programming) def=no ;; *) def=yes ;; esac
+            case "$c" in music|programming|opencode|claude|ollama) def=no ;; *) def=yes ;; esac
         fi
         hint=Y/n; [ "$def" = no ] && hint=y/N
         printf 'Include %-11s %-45s [%s] : ' "$c" "$(clabel "$c")" "$hint"
@@ -2966,7 +4247,7 @@ component_build() {
     for arg in "$@"; do
         case "$arg" in
             --all)  BUILD_COMP="$SELECT_ALL" ;;
-            --lib32|--wayland|--swayextras|--vulkan|--gaming|--extras|--flatpak|--sddm|--pantheon|--webkit|--plasma|--appimage|--fs|--iso|--music|--lutris|--fastfetch|--pipewire|--programming)
+            --lib32|--wayland|--swayextras|--vulkan|--gaming|--extras|--flatpak|--sddm|--mesa|--pantheon|--webkit|--plasma|--appimage|--fs|--iso|--music|--lutris|--fastfetch|--pipewire|--programming|--opencode|--claude|--ollama)
                 case " $BUILD_COMP " in *" ${arg#--} "*) : ;; *)
                     BUILD_COMP="$BUILD_COMP ${arg#--}" ;; esac ;;
             --list)
@@ -3007,6 +4288,9 @@ case "$STEP" in
     aliens)   run aliens ;;
     linux)    run linux ;;
     nvidia)   run nvidia ;;
+    nvidia-utils) run nvidia-utils ;;
+    nvidia-settings) run nvidia-settings ;;
+    lib32-nvidia-utils) run lib32-nvidia-utils ;;
     nvdiag)   run nvdiag ;;
     glibc32)  run glibc32 ;;
     lib32)    run lib32 ;;
@@ -3014,7 +4298,9 @@ case "$STEP" in
     seatd)    run seatd ;;
     tools)    run tools ;;
     wayland)  run wayland ;;
+    sway)     run sway ;;
     swayextras) run swayextras ;;
+    waylandcore) run waylandcore ;;
     vulkan)   run vulkan ;;
     steam)    run steam ;;
     winetools) run winetools ;;
@@ -3034,13 +4320,22 @@ case "$STEP" in
     music)    run music ;;
     nodejs)   run nodejs ;;
     go)       run go ;;
+    fzf)      run fzf ;;
+    html5lib) run html5lib ;;
+    qtwebengine) run qtwebengine ;;
+    sddmdeps) run sddmdeps ;;
     odin)     run odin ;;
     v)        run v ;;
+    dotnet)   run dotnet ;;
+    opencode) run opencode ;;
+    claude)   run claude ;;
+    ollama)   run ollama ;;
     network)  run network ;;
     modem)    run network ;;
     devices)  run devices ;;
     phone)    run devices ;;
     pipewire) run pipewire ;;
+    mesa)     run mesa ;;
     pantheon) run pantheon ;;
     webkit)   run webkit ;;
     appimage) run appimage ;;
@@ -3053,6 +4348,23 @@ case "$STEP" in
         # ProtonPlus repack), then refreshes work/rootfs from the ISO, then runs
         # step_livefix (apply-live-fixes.sh + gpg chain) on the fresh tree --
         # so the booted ISO actually contains every fix livefix covers.
+        #
+        # SDDM theme install fix (2026-10-08): the shipped KAuth was built
+        # with the CMake FAKE backend because Polkit-Qt-1 came AFTER KAuth in
+        # step_plasma (fixed there too). When the polkit-1 backend plugin is
+        # missing from the installed tree, force-rebuild KAuth now with the
+        # recipe's -DKAUTH_BACKEND_NAME=PolkitQt6-1 pin (creates
+        # lib/plugins/kf6/kauth/backend/kauth_backend_plugin.so) and
+        # regenerate its tarball so the merge below bakes it into the ISO.
+        # Without it every KAuth::Action dies with "The backend does not
+        # specify how to authorize".
+        if [ -d /Programs/KAuth/6.26.0 ] &&
+           [ ! -e /Programs/KAuth/6.26.0/lib/plugins/kf6/kauth/backend/kauth_backend_plugin.so ]
+        then
+            log "== Rebuilding KAuth 6.26.0 with the PolkitQt6-1 backend (missing kauth_backend_plugin.so)"
+            compile_forced KAuth 6.26.0 &&
+            package KAuth 6.26.0
+        fi
         log "== Repairing and re-baking the LiveCD (glibc 2.44-2, ProtonPlus, runtime fixes)"
         step_merge
         ;;
@@ -3067,15 +4379,83 @@ case "$STEP" in
         ensure_sdl_kcm
         ;;
     pkg)
-        [ $# -ge 3 ] || { echo "usage: build.sh pkg <Program> <Version>"; exit 1; }
-        compile "$2" "$3" && package "$2" "$3"
+        # Usage: build.sh pkg <Program> [Version]
+        #   - Version omitted -> newest version dir under the recipe that
+        #     actually ships a Recipe file (sort -V).
+        #   - <Program> resolves case-insensitively (pkg Opencode-Bin), then
+        #     by a UNIQUE substring match (pkg claude -> Claude-Desktop;
+        #     pkg opencode -> Opencode-bin; ambiguous patterns list their
+        #     candidates), and a missing local copy is synced from any
+        #     /mnt/repo tier dir (depth 2, e.g. Recipes/AI/Opencode-bin).
+        # NOTE: compile() skips when the package tarball or /Programs/<prog>/<ver>
+        # already exists, so this never re-downloads or rebuilds an installed
+        # program -- it only re-packages.  Use `pkgforced` to actually build.
+        # "${@:2}" drops $1 (the step name) -- $@ here is `<step> <prog> [ver]`.
+        # step_sync first: the recipe this step builds with lives in
+        # /Data/Compile/Recipes, a COPY of the repo's tree.  A stale copy
+        # silently rebuilds the program with the OLD options -- that is how
+        # Eudev got rebuilt today with the wrong --sysconfdir and produced a
+        # udevd that never scans /etc/udev (the live CD then hangs on
+        # "/dev/root").  See step_core's comment for the same trap.
+        step_sync &&
+        resolve_pkg_args pkg "${@:2}"
+        compile "$_prg" "$_ver" && package "$_prg" "$_ver"
         ;;
     pkgkeep)
         # Same-version rebuild into an installed tree (compile_keep skips
         # Pre_Installation_Preparation; plain `pkg` over an indexed package
         # dies in the sandbox). Usage: build.sh pkgkeep <Program> <Version>
+        # NOTE: compile_keep keeps the same `installed` guard, so an installed
+        # program is still skipped -- see `pkgforced`.
         [ $# -ge 3 ] || { echo "usage: build.sh pkgkeep <Program> <Version>"; exit 1; }
         compile_keep "$2" "$3" && package "$2" "$3"
+        ;;
+    pkgforced)
+        # Usage: build.sh pkgforced <Program> [Version]
+        # Force a REAL build even though the program is already installed, so
+        # the recipe is exercised end to end: the archive is downloaded from the
+        # recipe's `url`, checksum-verified, unpacked, patched, configured,
+        # built and installed.
+        #
+        # Why the plain step cannot do this:
+        #   compile()        skips on `/Programs/<prog>/<ver>` existing
+        #   compile_keep()   same `installed` guard
+        #   package()        re-tars the EXISTING tree; no fetch at all
+        # so an installed-but-never-built recipe (the ELFUtils/Eudev/Zstd/
+        # LibXxf86vm/LibXRandR case) would only ever be re-packaged and its URL,
+        # file format and build options would never be validated.
+        #
+        # The cached archive is deleted first: FetchArchive only re-downloads a
+        # file that is missing or fails its checksum ("File ${file} has been
+        # already downloaded" -> continue), so leaving /Data/Compile/Archives
+        # populated would verify nothing about `url`.
+        #
+        # Installed tree -> compile_forced (Compile --batch --keep): rebuilds in
+        # place, skipping Pre_Installation_Preparation, which would wipe and
+        # re-symlink the live tree.  No tree -> a normal fresh compile.
+        # "${@:2}" drops $1 (the step name) -- $@ here is `<step> <prog> [ver]`.
+        # step_sync first: without it this builds with the recipe copy that
+        # happens to sit in /Data/Compile/Recipes, which is NOT the repo's
+        # current recipe unless a sync happened to run earlier.  That is how
+        # Eudev was rebuilt with the old --sysconfdir=$settings_target and
+        # shipped a udevd that never scans /etc/udev: the initramfs is built
+        # by dracut in this build chroot, so it picks up that broken binary and
+        # the live CD hangs on "/dev/root".
+        step_sync &&
+        resolve_pkg_args pkgforced "${@:2}"
+        while read -r _af
+        do
+            [ -n "$_af" ] || continue
+            if [ -e "/Data/Compile/Archives/$_af" ]
+            then log "forced: dropping cached archive $_af (will be fetched again)"
+            else log "forced: archive $_af not cached; will be fetched"
+            fi
+            rm -f "/Data/Compile/Archives/$_af"
+        done < <(recipe_archives "$_prg" "$_ver" | sort -u)
+        if installed "$_prg" "$_ver"
+        then compile_forced "$_prg" "$_ver"
+        else compile "$_prg" "$_ver"
+        fi && package "$_prg" "$_ver"
         ;;
     all)
         run proton
