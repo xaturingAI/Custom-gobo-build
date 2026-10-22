@@ -10,9 +10,49 @@ import time
 import shutil
 import tarfile
 import tempfile
+import signal
 import subprocess
 from glob import glob
 from datetime import datetime
+
+# Static verifier for the generated initramfs.  It lives next to this script
+# and is imported, not shelled out, so the merge can abort before an ISO with
+# a broken initramfs is ever assembled.
+try:
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "verify_initramfs",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "verify-initramfs.py"))
+    verify_initramfs_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(verify_initramfs_module)
+except Exception as _error:  # pragma: no cover - the merge must not break
+    verify_initramfs_module = None
+    print("--> WARNING: could not load verify-initramfs.py (%s)" % _error)
+
+
+def check_initramfs(initramfs_path):
+    """Abort the merge when the generated initramfs cannot boot the live CD.
+
+    The check is static: it parses the initramfs cpio and verifies that the
+    kernel module chain the live CD needs is present and that udev is going to
+    scan /etc/udev/rules.d.  dracut drops its live-root rule there at boot
+    time; when udev's compiled in configuration directory does not point at
+    /etc/udev that rule is never applied, dmsquash-live-root never runs and
+    the ISO hangs with '"/dev/root" does not exist'.
+    """
+    if verify_initramfs_module is None:
+        print("--> WARNING: initramfs verification skipped "
+              "(verify-initramfs.py unavailable)")
+        return
+    problems = verify_initramfs_module.verify(initramfs_path)
+    if problems:
+        print("--> Initramfs verification FAILED for %s" % initramfs_path)
+        for problem in problems:
+            print("    * %s" % problem)
+        print("--> Refusing to build an ISO with a broken initramfs")
+        sys.exit(1)
+    print("--> Initramfs verification passed for %s" % initramfs_path)
 
 class MountError(Exception):
     def __init__(self, expression, message):
@@ -302,15 +342,76 @@ class ISOLinux:
         print("--> Updating Initramfs for the Live image")
         if Initramfs().create(self.old_kernel_path, self.old_initramfs) == False:
             sys.exit(1)
+        # A syntactically valid initramfs is not enough: the live CD only
+        # boots when the kernel module chain is complete AND udev scans
+        # /etc/udev/rules.d (dracut's live-root rule lives there).  Abort
+        # here rather than shipping an ISO that hangs at boot.
+        check_initramfs(self.old_initramfs)
         # Set the needs_initramfs_refresh flag so that the initramfs
         # for the Installed system can be rebuilt as well
         self.needs_initramfs_refresh = True
+
+# dracut (Dracut 103) spawns dracut-install which can spin at 100% CPU while
+# resolving modules and ignores SIGTERM; without a hard bound a bad module
+# index silently hangs the whole merge for hours (observed: 11 h). Run dracut
+# in its own session so the entire process group can be taken down with
+# SIGKILL, which no process can ignore.
+def run_dracut(cmd, budget=1500):
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    try:
+        proc.communicate(timeout=budget)
+    except subprocess.TimeoutExpired:
+        print(f"--> dracut exceeded {budget}s; SIGKILLing its process group")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        return None
+    except KeyboardInterrupt:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+    return proc.returncode
+
+# Dracut 103's bundled dracut-install infinite-loops at 100% CPU while
+# resolving kernel modules on GoboLinux (fw_devlink "suppliers" scan,
+# upstream regression commit 3de4c731; see dracut-ng/dracut#2155). The
+# reporter proved a pre-v060 dracut-install works with the stock 103
+# scripts. We vendor a v059 build here and keep the stock binary aside as
+# dracut-install.103.bak. Re-apply it after every run so a rebuild or
+# extraction that restores the stock binary cannot reintroduce the hang.
+# squashfs_dir="" targets this build chroot's /Programs tree (where dracut
+# runs below); squashfs_dir=<work>/rootfs targets the assembled Live rootfs
+# so the final ISO carries the fixed binary too.
+def ensure_safe_dracut_install(squashfs_dir=""):
+    safe_path = "/Programs/Dracut/Current/lib/dracut/dracut-install.v059"
+    dracut_dir = f"{squashfs_dir}/Programs/Dracut/Current/lib/dracut"
+    install_path = f"{dracut_dir}/dracut-install"
+    if not os.path.exists(safe_path):
+        print("--> WARNING: dracut-install.v059 not found; leaving stock binary")
+        return
+    if not os.path.exists(install_path):
+        return
+    viewed_as = squashfs_dir or "/"
+    if not os.path.exists(f"{dracut_dir}/dracut-install.v059"):
+        shutil.copy2(safe_path, f"{dracut_dir}/dracut-install.v059")
+        os.chmod(f"{dracut_dir}/dracut-install.v059", 0o755)
+    if os.path.getsize(install_path) != os.path.getsize(safe_path):
+        shutil.copy2(safe_path, install_path)
+        os.chmod(install_path, 0o755)
+        print(f"--> Replaced stock dracut-install with pre-v060 (v059) build in {viewed_as}")
 
 class Initramfs:
     def create(self, kernel_path, initramfs_path, live=True):
         kernel_version = self.kernelVersion(kernel_path)
         cmd = self.liveString(kernel_version) if live else self.installedString(kernel_version)
-        subprocess.run(cmd)
+        if run_dracut(cmd) is None:
+            print(f"Failed to generate initramfs for {kernel_version} (dracut timed out)")
+            return False
         new_initramfs_path = f"/System/Kernel/Boot/initramfs-{kernel_version}.img"
         if not os.path.exists(new_initramfs_path):
             print("Failed to generate initramfs file")
@@ -330,6 +431,29 @@ class Initramfs:
         ]
 
     def liveString(self, kernel_version):
+        # The invocation MUST stay in sync with BUILD.md §"Initramfs":
+        #
+        #   dracut --kver <release> -m "bash kernel-modules kernel-modules-extra
+        #   udev-rules base fs-lib shutdown img-lib dmsquash-live"
+        #   --filesystems "squashfs iso9660" --show-modules --force
+        #
+        # That is the EXACT command line that produced the stock
+        # GoboLinux-017.01 ISO's initramfs, and that initramfs boots. This
+        # script had drifted to an extra "--no-hostonly --add-drivers
+        # 'usb-storage uas'", and the initramfs that produced HANGS the kernel
+        # before dracut's init even runs (verified: the stock 017.01 kernel
+        # boots the stock initramfs but hangs on the new one; the new kernel
+        # boots fine with no initramfs at all). Symptoms on the booted ISO:
+        # the console stops right after the early kernel messages and dracut
+        # never appears; a stale build reports
+        #   dracut warning: "/dev/root" does not exist
+        # because no root device is ever found.
+        #
+        # Do NOT re-add --no-hostonly here without re-testing the boot: the
+        # non-hostonly module set is what came with the broken initramfs.
+        # The USB mass-storage drivers (usb-storage/uas) that a USB-stick
+        # boot needs are already covered by "kernel-modules-extra" in the
+        # stock configuration, and the iso9660 driver by --filesystems.
         return [
             "dracut",
             "--kver", kernel_version,
@@ -505,21 +629,97 @@ def main():
     # the merged rootfs), and dracut resolves kernel modules through this
     # chroot's /lib/modules/<kver>. Installing the OpenZFS package re-links the
     # index's module metadata (modules.dep & friends) on top of the kernel's
-    # complete copies with OpenZFS's own zfs-only dep file, so without a regen
-    # here dracut cannot see the overlay module and the dmsquash-live initramfs
-    # fails to build; depmod rewrites the (index-visible) metadata with the full
-    # module set scanned from the kernel tree.
+    # complete copies with OpenZFS's own zfs-only dep file. Re-running depmod
+    # rebuilds the full set but ALSO indexes the NVIDIA modules (uncompressed
+    # .ko files dropped into an otherwise zstd-compressed tree), and
+    # dracut-install in Dracut 103 spins forever at 100% CPU over that state.
+    # The kernel tree's own metadata is already the complete, self-consistent
+    # set (full module list + the overlay zfs/spl, written by the same kmod
+    # depmod dracut links against), so point the index at it instead of
+    # running depmod: dracut then resolves exactly what the kernel build
+    # produced, with no NVIDIA entries.
+    #
+    # This MUST replace the index entries, not just overwrite regular files.
+    # Gobo's SymlinkProgram links a program's whole lib/ dir into
+    # /System/Index/lib, so whichever program was linked LAST owns the index:
+    # after OpenZFS is linked, /lib/modules/<kver>/modules.dep is a symlink to
+    # OpenZFS's 2-line zfs-only dep file and the kernel's 6000-line one is
+    # shadowed. modprobe then cannot resolve 'overlay', dracut skips
+    # 90overlayfs, dmsquash-live (which depends on it) is skipped too, NO
+    # initramfs is produced and the merge dies with "Failed to generate
+    # initramfs file". The old code below only copied over *regular* files
+    # ("not os.path.islink(dst)"), so it silently mirrored 0 files and the
+    # merge kept failing.
     build_moddir = "/Programs/Linux/Current/lib/modules"
     if os.path.isdir(build_moddir):
-        build_kver = None
-        for entry in sorted(os.listdir(build_moddir)):
-            path = os.path.join(build_moddir, entry)
+        real_modroot = os.path.realpath(build_moddir)
+        real_kver = None
+        for entry in sorted(os.listdir(real_modroot)):
+            path = os.path.join(real_modroot, entry)
             if os.path.isdir(path) and not os.path.islink(path):
-                build_kver = entry
+                real_kver = entry
                 break
-        if build_kver is not None:
-            print(f"--> Regenerating module dependencies for the build chroot ({build_kver})")
-            subprocess.run(["depmod", build_kver], check=False)
+        if real_kver is not None:
+            real_moddir = os.path.join(real_modroot, real_kver)
+            idx_moddir = f"/lib/modules/{real_kver}"
+
+            def repoint_metadata(src_dir, dst_dir):
+                # Make every regular file of src_dir be the one reached from
+                # dst_dir. Existing symlinks pointing elsewhere (OpenZFS's
+                # zfs-only metadata) are replaced; regular files (depmod's
+                # own output) are left alone; missing entries are created.
+                changed = 0
+                if not os.path.isdir(src_dir) or not os.path.isdir(dst_dir):
+                    return 0
+                for name in sorted(os.listdir(src_dir)):
+                    src = os.path.join(src_dir, name)
+                    dst = os.path.join(dst_dir, name)
+                    if not os.path.isfile(src) or os.path.islink(src):
+                        continue
+                    if os.path.islink(dst):
+                        if os.path.realpath(dst) == os.path.realpath(src):
+                            continue
+                        os.unlink(dst)
+                    elif os.path.exists(dst):
+                        continue
+                    os.symlink(src, dst)
+                    changed += 1
+                return changed
+
+            repointed = repoint_metadata(real_moddir, idx_moddir)
+            # The ZFS modules live in the kernel tree's extra/ dir; keep the
+            # index pointing at the kernel's copies so the index stays valid
+            # even if the OpenZFS program is removed or rebuilt.
+            repointed += repoint_metadata(
+                os.path.join(real_moddir, "extra"),
+                os.path.join(idx_moddir, "extra"))
+            print(f"--> Module metadata index for {real_kver}: {repointed} entr(ies) repointed at the kernel tree")
+
+            # Sanity check the modules dracut needs for the live initramfs.
+            # Without this the only symptom is dracut's cryptic
+            # "Module 'overlayfs' will not be installed" three lines before
+            # the merge gives up.
+            unresolved = []
+            for mod in ("overlay", "squashfs", "loop"):
+                probe = subprocess.run(
+                    ["modprobe", "-d", "/", "-S", real_kver, "--dry-run", mod],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if probe.returncode == 0:
+                    print(f"--> modprobe resolves '{mod}' for kernel {real_kver}")
+                else:
+                    detail = probe.stderr.decode(errors="replace").strip()
+                    unresolved.append(mod)
+                    print(f"WARNING: modprobe cannot resolve '{mod}' for kernel {real_kver}: {detail}")
+            if unresolved:
+                print(f"WARNING: dracut will skip the modules depending on {', '.join(unresolved)}; "
+                      f"the live initramfs (dmsquash-live) cannot be built.")
+
+    # Guard the initramfs build against the Dracut 103 dracut-install hang
+    # (see ensure_safe_dracut_install): both dracut runs below resolve
+    # modules through this chroot's /Programs/Dracut tree. Fix the build
+    # chroot (used by dracut) and the assembled rootfs (shipped in the ISO).
+    ensure_safe_dracut_install()
+    ensure_safe_dracut_install(f"{work_dir}/rootfs")
 
     # Update kernel image used by the Live environment
     boot_path = "/Programs/Linux/Current/Resources/Unmanaged/System/Kernel/Boot"
