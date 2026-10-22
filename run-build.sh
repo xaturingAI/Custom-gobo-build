@@ -1,8 +1,19 @@
 #!/bin/bash
 # Sets up the GoboLinux chroot bind mounts and runs the build inside it.
 # Usage (as root):  sudo ./run-build.sh [step] [args]
-# Steps: proton sync linux nvidia glibc32 fs lib32 cmake seatd tools wayland swayextras vulkan steam winetools mingw winedev protonplus lutris ffxiv music nodejs go odin fastfetch network pipewire pycompat pyxml core elogind_base flatpak sddm extras webkit appimage pantheon plasma merge livefix pkg pkgkeep all detach
+#   (no step)      -> interactive Y/N component menu (Enter keeps each shown
+#                     default; defaults are remembered in .build-select)
+# Steps: proton sync aliens linux nvidia nvidia-utils nvidia-settings lib32-nvidia-utils nvdiag glibc32 fs lib32 cmake seatd tools wayland sway swayextras vulkan steam winetools mingw winedev protonplus lutris ffxiv music nodejs go fzf html5lib odin v dotnet opencode claude ollama fastfetch network modem devices phone pipewire pycompat pyxml core elogind_base flatpak sddm mesa extras webkit appimage pantheon plasma qtwebengine sddmdeps gamekcm merge livefix test pkg pkgkeep pkgforced all detach
 #   e.g. sudo ./run-build.sh pkg LibCanberra 0.30
+#        sudo ./run-build.sh pkg opencode      (Version optional: newest dir;
+#                                               case-insensitive; unique
+#                                               substring works too: pkg claude)
+#   'pkgforced <prog> [ver]' forces a REAL download+build of a program that is
+#   already installed: it drops the cached source archive from
+#   /Data/Compile/Archives and the package tarball, then runs Compile --keep in
+#   place.  Use it to prove a recipe actually fetches its `url` and builds
+#   (plain 'pkg' skips anything already installed and only re-packages).
+#   e.g. sudo ./run-build.sh pkgforced Zstd 1.4.4
 #   'nvidia' verifies the 5 kernel modules under
 #   /Programs/Linux/Current/lib/modules/7.1.5/.../drivers/video; if the tarball
 #   exists but the modules are missing it deletes the tarball and rebuilds.
@@ -11,6 +22,20 @@
 #   the udev PCI 0x10de rule that auto-loads the driver stack at boot on real
 #   NVIDIA hardware, and /usr/share/X11/xorg.conf.d/10-nvidia.conf (Xorg
 #   OutputClass -> nvidia DDX for full nvidia-settings under plasmax11).
+#   Since the Arch-style split, 'nvidia' builds only the driver (kernel modules
+#   + Xorg DDX, plus the GSP/ucode firmware -- a separate
+#   linux-firmware-nvidia package was considered and skipped: it would only
+#   re-copy the same 4 blobs from this same .run) and then chains 'nvidia-utils'
+#   automatically:
+#     'nvidia-utils'          -> 64-bit/32-bit libs, tools, Vulkan ICDs, glvnd
+#                                EGL vendor JSONs, OpenCL ICD, udev rule,
+#                                modprobe blacklist, Xorg OutputClass,
+#                                application profiles -> /Programs/Nvidia-Utils
+#     'nvidia-settings'       -> the nvidia-settings 610.57.04 panel, built from
+#                                NVIDIA's standalone source tarball (not the
+#                                .run) -> /Programs/Nvidia-Settings
+#   'nvidia-utils' and 'nvidia-settings' also run standalone (they re-stage
+#   their own recipe from /mnt/repo).
 #   'glibc32' builds the minimal 32-bit base (glibc/libgcc/libstdc++).
 #   'lib32' builds all 32-bit gaming libraries (X11, GL, audio, SDL2, etc.)
 #     that the Steam client and Wine/Proton need. Run AFTER glibc32.
@@ -28,6 +53,16 @@
 #     into the ISO rootfs — no explicit package list needed. step_livefix
 #     re-applies all runtime fixes to work/rootfs, INCLUDING the NVIDIA
 #     enablement (modprobe.conf, udev PCI auto-load, Xorg OutputClass).
+#     apply-live-fixes.sh section 14e owns ALL GPU driver manifests: it turns
+#     the (base-ISO) symlinks
+#       /System/Index/share/vulkan/{icd.d,implicit_layer.d,explicit_layer.d}
+#          -> /Programs/Mesa/19.3.3/share/vulkan/...
+#     and the GLVND EGL vendor dir into real aggregation directories, drops
+#     the stale nvidia_* leftovers and links EVERY driver manifest from the
+#     program that owns it -- NVIDIA (icd + vksc + implicit layer), the Intel
+#     ICDs (Vulkan-Intel) and Mesa -- so the loaders see all of them instead
+#     of only Intel.  nvidia-sysroot-vulkan-fix.sh is deprecated: its job is
+#     now part of apply-live-fixes.sh.
 #     'merge' FIRST rebuilds the ISO runtime fixes (ensure_livefix_builds) so
 #     they are baked in: the 64-bit Glibc 2.44-2 upgrade (base ISO ships 2.30;
 #     FastFetch + ProtonPlus's bundled GTK4 need up to GLIBC_2.44) and the
@@ -76,10 +111,37 @@
 #     release; fully static single binary with base/core/shared/vendor shipped
 #     beside it under the program root -- ODIN_ROOT is auto-detected from
 #     /proc/self/exe -- linked at runtime by the ISO's cc/ld).
-#     All three are offered together in the interactive menu as the
+#   'dotnet' builds the .NET toolchain from Microsoft's official binary
+#     tarballs: Dotnet-Sdk 10.0.401 (LTS, default `dotnet`), SDKs 6.0.428 /
+#     8.0.425 / 9.0.318, Dotnet-Runtime 10.0.12, Dotnet-Host 10.0.12 and
+#     Dotnet-Targeting-Pack 10.0.12 (Gobo ProperCase recipe names). Pure manifest
+#     installs (the muxer keeps the standard /usr/share/dotnet root layout;
+#     post_install symlinks /System/Index/bin/dotnet). These power the
+#     Alien-Dotnet plugin (`sudo Alien --install Dotnet:<pkg>` -> `dotnet add
+#     package`) and cover the AUR xivlauncher dotnet make-dep names.
+#     All are offered together in the interactive menu as the
 #     'programming' component (default off; --programming, or individual
-#     steps nodejs/go/odin). Their packages bake into the ISO via 'merge' like
-#     any other component.
+#     steps nodejs/go/odin/dotnet). Their packages bake into the ISO via
+#     'merge' like any other component.
+#   'opencode' / 'claude' / 'ollama' build the three optional AI recipes
+#     under Recipes/AI/ -- each is its own menu component with a Y/N prompt
+#     and defaults to 'no' (or pass --opencode/--claude/--ollama):
+#       opencode - Opencode-ai 1.18.34 AI coding agent CLI: one glibc ELF from
+#                  the official release tarball -> bin/opencode (MIT).
+#       claude   - Claude Desktop 2.26454.2 from Anthropic's apt .deb payload:
+#                  Electron tree -> lib/claude-desktop, generated
+#                  bin/claude-desktop launcher passes --no-sandbox (Heroic
+#                  rationale: chrome-sandbox cannot be setuid on a Live CD;
+#                  the setuid helper is removed from the tree). Menu entry +
+#                  hicolor icons ship as unmanaged system files; dpkg
+#                  maintainer scripts are intentionally skipped.
+#       ollama   - Ollama 0.34.0 local LLM runtime: bin/ollama +
+#                  lib/ollama backends bundling llama.cpp CPU kernels and the
+#                  CUDA 12/13 runtimes. WARNING: 1.34 GB archive / 2.11 GB
+#                  extracted, roughly 1.2 GB extra on the ISO squashfs.
+#     One-shot builds: `sudo ./run-build.sh pkg opencode` (pkg now defaults
+#     to the newest version dir and matches the program name
+#     case-insensitively; `pkg Opencode-ai 1.18.34` still works).
 #   'pipewire' builds the full system-wide audio stack: ALSA-Lib 1.2.13 (a
 #     mandatory bump -- PipeWire 1.4.0 hard-requires alsa >= 1.2.10 and the
 #     base ISO ships 1.2.2; libasound.so.2 is ABI-stable so existing consumers
@@ -230,6 +292,9 @@
 #   sudo ./run-build.sh protonplus # optional: ProtonPlus 0.6.8 (gaming manager)
 #   sudo ./run-build.sh ffxiv    # optional: XIVLauncher 7.0.20 under Wine
 #   sudo ./run-build.sh music    # optional: LMMS 1.3.0-alpha.2 DAW
+#   sudo ./run-build.sh opencode # optional: Opencode-ai AI coding agent CLI
+#   sudo ./run-build.sh claude   # optional: Claude Desktop (Electron app)
+#   sudo ./run-build.sh ollama   # optional: Ollama runtime (+~1.2 GB on ISO!)
 #   sudo ./run-build.sh pycompat
 #   sudo ./run-build.sh pyxml
 #   sudo ./run-build.sh core     # shared foundation
@@ -238,10 +303,28 @@
 #   sudo ./run-build.sh extras   # Discord only
 #   sudo ./run-build.sh fastfetch # optional: FastFetch system-info tool
 #   sudo ./run-build.sh webkit   # WebKitGTK 4.1 (Lutris web connect)
+#   sudo ./run-build.sh mesa     # Mesa 3D graphics stack alone (LLVM/clang +
+#       # SPIR-V CLC toolchain + LibGLVnd + Mesa); no Pantheon desktop needed
 #   sudo ./run-build.sh pantheon
 #   sudo ./run-build.sh plasma   # Plasma 6.7 desktop
+#   sudo ./run-build.sh fzf      # optional: fzf 0.74.4 fuzzy finder (needs 'go')
 #   sudo ./run-build.sh merge
 #   # then on the host:  ./finalize-iso.sh
+#
+#   SDDM theme-install extras (opt-in, NOT part of 'all'):
+#     sudo ./run-build.sh qtwebengine   # QtWebEngine 6.10.3 ONLY. Read the
+#       # warning in step_qtwebengine first: 881 MB tarball with the full
+#       # Chromium source (134.0.6998.208 patched to 146.0.7680.164), compiled
+#       # with GN+make. Hours of build time and 15-25 GB of scratch space in
+#       # /Data/Compile/Sources. Required for the SDDM KCM theme *preview*
+#       # pane and Plasma's WebEngine-backed surfaces; the rest of the ISO
+#       # works without it.
+#     sudo ./run-build.sh html5lib   # HTML5Lib 1.1 (+ six, webencodings) into
+#       # site-packages. QtWebEngine's configure refuses to build without an
+#       # importable html5lib; step_qtwebengine runs this for you, so you only
+#       # need it directly when testing the QtWebEngine configure step alone.
+#     sudo ./run-build.sh sddmdeps   # fzf + qtwebengine in one go
+#       # (fzf is the cheap one; qtwebengine runs step_plasma + step_html5lib).
 #
 #   Or all-in-one:  sudo ./run-build.sh all
 set -e
@@ -293,7 +376,124 @@ bind_rprivate /dev/pts "$ROOT/dev/pts"
 bind_private "$GB" "$ROOT/mnt/gobo-build"
 bind_private "$REPO" "$ROOT/mnt/repo" || { echo "recipes repo not found at $REPO (override with REPO=)"; exit 1; }
 
-cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
+# ---------------------------------------------------------------------------
+# BinUtils 2.43.1 bootstrap -- the RELR-aware linker glibc 2.44-2 needs.
+# ---------------------------------------------------------------------------
+# glibc 2.44-2's libc.so.6 stores its dynamic relocations in a .relr.dyn
+# section (SHT_RELR, ELF type 0x13). The ISO's BinUtils 2.33.1 predates
+# SHT_RELR (added in 2.38), so once the index points at 2.44-2 EVERY link
+# dies with:
+#   ld.bfd: /lib/libc.so.6: unknown type [0x13] section `.relr.dyn'
+#   ld.bfd: cannot find /lib/libc.so.6
+# starting with Mesa (step_merge)'s meson sanity link -- "Compiler cc cannot
+# compile programs". The old 2.33.1 ld.bfd CAN still link a *2.30* glibc
+# (no .relr.dyn), so build+install BinUtils 2.43.1 while the index is
+# temporarily and CONSISTENTLY on 2.30; its ld.bfd then links the 2.44-2
+# runtime for good. 2.43.1's bin/ld IS ld.bfd (--enable-ld=default), and its
+# install re-points /System/Index/bin/{ld,as,ar,...} at the new tree.
+#
+# The install runs SymlinkProgram and libtool's "--finish" ldconfig, either of
+# which would re-point the glibc SONAME links MID-BUILD and desync the still-
+# 2.30 chroot ("_dl_call_libc_early_init: Assertion 'sym != NULL' failed").
+# Point the index ldconfig at /bin/true for the duration so the 2.30 flip
+# cannot be undone; restore it afterwards (repoint_glibc_runtime() below then
+# re-points the glibc links back to 2.44-2). Idempotent: a present 2.43.1
+# ld.bfd short-circuits the whole step.
+bootstrap_binutils() {
+    local ld="$ROOT/Programs/BinUtils/2.43.1/bin/ld.bfd"
+    [ -x "$ld" ] && { echo "== BinUtils 2.43.1 already installed"; return 0; }
+    [ -f "$ROOT/Data/Compile/Recipes/BinUtils/2.43.1/Recipe" ] || \
+        { echo "== no BinUtils 2.43.1 recipe staged; skipping bootstrap"; return 0; }
+
+    local idx="$ROOT/System/Index/lib" g
+    echo "== bootstrapping BinUtils 2.43.1 on the consistent glibc 2.30 index"
+    for g in \
+        ld-linux-x86-64.so.2 ld-lsb-x86-64.so.3 \
+        libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 \
+        libutil.so.1 libanl.so.1 libBrokenLocale.so.1 libmvec.so.1 \
+        libresolv.so.2 libcrypt.so.1 libnss_compat.so.2 libnss_dns.so.2 \
+        libnss_files.so.2 libnss_hesiod.so.2 libnss_db.so.2 libthread_db.so.1
+    do
+        [ -e "$ROOT/Programs/Glibc/2.30/lib/$g" ] || continue
+        ln -snf "/Programs/Glibc/2.30/lib/$g" "$idx/$g"
+    done
+
+    # Freeze ldconfig so the build's install cannot re-point the loader/libc;
+    # remember the originals (2.44-2) to restore them exactly.
+    local d orig_bin orig_sbin
+    orig_bin="$(readlink "$ROOT/System/Index/bin/ldconfig" 2>/dev/null)"
+    orig_sbin="$(readlink "$ROOT/System/Index/sbin/ldconfig" 2>/dev/null)"
+    [ -n "$orig_bin" ]  && ln -snf /bin/true "$ROOT/System/Index/bin/ldconfig"
+    [ -n "$orig_sbin" ] && ln -snf /bin/true "$ROOT/System/Index/sbin/ldconfig"
+
+    # Force a fresh recipe sync: the staged copy may predate Resources/.
+    rm -rf "$ROOT/Data/Compile/Recipes/BinUtils"
+    chroot "$ROOT" /bin/bash /mnt/gobo-build/build.sh pkg BinUtils 2.43.1 \
+        || echo "== WARNING: BinUtils 2.43.1 bootstrap failed (continuing)"
+
+    [ -n "$orig_bin" ]  && ln -snf "$orig_bin"  "$ROOT/System/Index/bin/ldconfig"
+    [ -n "$orig_sbin" ] && ln -snf "$orig_sbin" "$ROOT/System/Index/sbin/ldconfig"
+}
+bootstrap_binutils
+
+# Glibc 2.44-2 runtime re-point. The chroot boots via /System/Index/lib SONAME
+# symlinks; point the glibc ones at the 2.44-2 tree (matching the shipped
+# work/rootfs, where the glibc upgrade already landed) so the merge's host tools
+# (e.g. kcmdesktopfilegenerator loading the GLib 2.84.4 that needs GLIBC_2.34)
+# actually run. This MUST happen HOST-SIDE, before the chroot bash starts:
+# flipping the loader inside a live chroot leaves the old libc mapped and every
+# subsequent exec dies with "_dl_call_libc_early_init: Assertion 'sym != NULL'
+# failed!". Idempotent; also heals a previously half-flipped index on re-run.
+# /etc/ld.so.cache maps SONAMEs THROUGH /System/Index/lib, so no ldconfig needed.
+repoint_glibc_runtime() {
+    local rt="$ROOT/Programs/Glibc/2.44-2/lib"
+    [ -f "$rt/libc.so.6" ] || { echo "== no glibc 2.44-2 tree yet; live chroot stays on 2.30"; return 0; }
+    local idx="$ROOT/System/Index/lib"
+    local changed=0 l
+    for l in \
+        ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 \
+        librt.so.1 libthread_db.so.1 libutil.so.1 libanl.so.1 \
+        libBrokenLocale.so.1 libmvec.so.1 libcrypt.so.1 libresolv.so.2 \
+        libnss_compat.so.2 libnss_dns.so.2 libnss_files.so.2 \
+        libnss_hesiod.so.2 libnss_db.so.2
+    do
+        [ -e "$rt/$l" ] || { echo "  (skip $l: not in 2.44-2 tree)"; continue; }
+        if [ "$(readlink "$idx/$l" 2>/dev/null)" != "/Programs/Glibc/2.44-2/lib/$l" ]; then
+            ln -snf "/Programs/Glibc/2.44-2/lib/$l" "$idx/$l"
+            changed=$((changed+1))
+        fi
+    done
+    # Drop leftover 2.30 index entries. Gobo's SymlinkProgram runs
+    # ldconfig after every install, and ldconfig re-creates the SONAME symlinks
+    # above pointing AT these stale 2.30 files (libc.so.6 already rewrites to
+    # '-> libc-2.30.so'), silently undoing the re-point before Plasma-Desktop
+    # rebuilds. With no 2.30 candidate left, ldconfig has nothing to flip to.
+    # Purge by TARGET (any 2.30-referencing name), then restore the
+    # libthread_db-1.0.so versioned name that ldconfig prefers for libthread_db.
+    local purged=0 f
+    # NOTE: plain readlink, NOT readlink -f. The index links have ABSOLUTE targets
+    # (/Programs/Glibc/2.30/...) that exist only INSIDE the chroot; on the host
+    # "readlink -f" resolves them against the host root, finds no such directory
+    # and prints NOTHING, so this purge silently removed nothing (verified), and
+    # ldconfig (SymlinkProgram, libtool --finish's "ldconfig -n /usr/lib") was free
+    # to flip libc.so.6 / ld-linux back to the stale 2.30 candidates, leaving a
+    # 2.44 loader on a 2.30 libc: "_dl_call_libc_early_init: Assertion sym != NULL".
+    for f in "$idx"/*; do
+        [ -L "$f" ] || continue
+        case "$(readlink "$f" 2>/dev/null)" in
+            */Programs/Glibc/2.30/*) rm -f "$f"; purged=$((purged+1));;
+        esac
+    done
+    # target is the IN-CHROOT path ("$rt" is a HOST path and would dangle inside the chroot)
+    [ -f "$rt/libthread_db-1.0.so" ] && ln -sfn "/Programs/Glibc/2.44-2/lib/libthread_db-1.0.so" "$idx/libthread_db-1.0.so"
+    [ "$purged" -gt 0 ] && echo "== removed $purged stale 2.30 index entries"
+    if [ "$changed" -eq 0 ]; then
+        echo "== live glibc runtime already on 2.44-2"
+    else
+        echo "== re-pointed $changed live glibc SONAME links to 2.44-2"
+    fi
+}
+repoint_glibc_runtime
 
 echo "== chroot ready; running build.sh $*"
 exec chroot "$ROOT" /bin/bash /mnt/gobo-build/build.sh "$@"
