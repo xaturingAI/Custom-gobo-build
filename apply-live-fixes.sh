@@ -22,10 +22,198 @@
 #  13. dbus-daemon-launch-helper reachable at common FHS paths
 #  14. GLVND EGL vendor files: materialize /usr/share/glvnd/egl_vendor.d with
 #      Mesa (+ optional Nvidia) vendor JSON so EGL always initializes
+#  15  Hard rule never change how  the live user has Sudo use never chang anything with  live ALL=(ALL) NOPASSWD: ALL
+#  16  hard rule Never change any code for  work/rootfs/Programs/Sudo/Settings/sudoers for  live ALL=(ALL) NOPASSWD: ALL 
 set -u
 TREE="${1:?usage: apply-live-fixes.sh <rootfs-tree>}"
 [ -d "$TREE/Programs" ] || { echo "not a rootfs tree: $TREE"; exit 1; }
 say() { echo "[livefix] $*"; }
+
+# ---------------------------------------------------------------------------
+# GPU driver manifests -- ONE authoritative place.
+#
+# The runtime loaders scan FIVE directories.  Inside the ISO they all resolve
+# through /usr/share -> ../System/Index/share:
+#
+#   vulkan/icd.d/*.json               Vulkan ICDs          (Vulkan loader)
+#   vulkan/implicit_layer.d/*.json     Vulkan layers        (Vulkan loader)
+#   vulkan/explicit_layer.d/*.json     Vulkan layers        (Vulkan loader)
+#   glvnd/egl_vendor.d/*.json          EGL vendors         (libglvnd)
+#   egl/egl_external_platform.d/*.json  EGL ext platforms   (libglvnd)
+#
+# The base ISO ships some of them as ABSOLUTE symlinks into a program dir, e.g.
+#   System/Index/share/glvnd -> /Programs/Mesa/19.3.3/share/glvnd
+#   System/Index/share/vulkan/icd.d -> /Programs/Mesa/19.3.3/share/vulkan/icd.d
+# Those targets only exist inside the ISO, so on the build host they dangle:
+# `mkdir -p` is a no-op and every `ln -sf` either writes THROUGH the symlink
+# into the dead program dir or fails with ENOENT.  That is how the NVIDIA
+# Vulkan ICDs ended up invisible to the loader ("vulkaninfo" listed Intel
+# only) and how the nvidia EGL vendor JSONs ended up inside the Mesa program
+# tree instead of the Nvidia one.
+#
+# gpu_real_dir()      turns a symlinked manifest dir (or a symlinked PARENT of
+#                     one) into a REAL aggregation directory, keeping the
+#                     entries it already had as symlinks to their owner and
+#                     dropping the stale nvidia_* leftovers.
+# gpu_link_manifests() links every manifest from the program that owns it.
+#
+# Both are idempotent and host-safe: they never dereference an ISO-only
+# absolute symlink.
+# ---------------------------------------------------------------------------
+gpu_real_dir() {
+    # Ensure $1 is a REAL directory inside the tree.
+    #
+    # It may be the manifest dir itself that is the symlink
+    # (share/vulkan/icd.d -> /Programs/Mesa/<v>/share/vulkan/icd.d) or one of
+    # its PARENTS (share/egl -> /Programs/Mesa/<v>/share/egl, with the manifest
+    # dir inside it).  Both cases have to end up as real dirs, otherwise
+    # `mkdir -p` fails with "File exists" on the dangling parent and every
+    # manifest link that follows fails with ENOENT.
+    #
+    # When the symlink is replaced, the entries the old dir already had are
+    # kept as symlinks to the program that owns them.
+    local p="$1" parent base tgt real tmp f bn kept
+    if [ -d "$p" ] && [ ! -L "$p" ]; then
+        return 0
+    fi
+    parent="$(dirname "$p")"
+    base="$(basename "$p")"
+    if [ "$parent" != "$p" ]; then
+        gpu_real_dir "$parent"
+    fi
+    if [ -L "$p" ]; then
+        tgt="$(readlink "$p")"
+        case "$tgt" in
+            /*) real="$TREE$tgt" ;;
+            *)  real="$parent/$tgt" ;;
+        esac
+        if [ -d "$real" ]; then
+            tmp="${p}.tmp.$$"
+            rm -rf "$tmp"; mkdir -p "$tmp"
+            kept=0
+            for f in "$real"/*; do
+                [ -e "$f" ] || continue
+                bn="$(basename "$f")"
+                # stale nvidia leftovers are re-linked below from their owner
+                case "$bn" in nvidia_*) continue ;; esac
+                ln -sf "/${f#$TREE/}" "$tmp/$bn"
+                kept=$((kept+1))
+            done
+            rm -f "$p"
+            mv "$tmp" "$p"
+            say "GPU manifests: ${p#$TREE/} was a symlink to $tgt -> real dir ($kept entries kept)"
+        else
+            rm -f "$p"; mkdir -p "$p"
+            say "GPU manifests: ${p#$TREE/} was a symlink to $tgt (target gone) -> real dir"
+        fi
+    else
+        mkdir -p "$p"
+    fi
+    return 0
+}
+
+gpu_link_ok() {
+    # A manifest link points at an ABSOLUTE /Programs/... path, which only
+    # resolves inside the ISO -- on the build host the link is dangling, so a
+    # plain -e test says "missing" for a perfectly good link.  Resolve it
+    # against the tree instead.
+    local l="$1" t
+    [ -L "$l" ] || return 1
+    t="$(readlink "$l")"
+    case "$t" in
+        /*) [ -e "$TREE$t" ] ;;
+        *)  [ -e "$(dirname "$l")/$t" ] ;;
+    esac
+}
+
+gpu_link_manifests() {
+    # $1 = destination dir, relative to System/Index/share
+    # $2.. = source dirs inside the tree; the FIRST source wins per basename
+    local rel="$1"; shift
+    local dest="$TREE/System/Index/share/$rel"
+    local src j b n=0
+    gpu_real_dir "$dest"
+    for src in "$@"; do
+        [ -d "$src" ] || continue
+        for j in "$src"/*.json; do
+            [ -f "$j" ] || continue
+            b="$(basename "$j")"
+            # an already good link means an earlier source won -- keep it
+            if gpu_link_ok "$dest/$b"; then continue; fi
+            if ln -sf "/${j#$TREE/}" "$dest/$b" 2>/dev/null; then
+                n=$((n+1))
+            else
+                say "GPU manifests: FAILED to link $b into $rel"
+            fi
+        done
+    done
+    say "GPU manifests: $rel <- $n manifest(s) linked"
+    return 0
+}
+
+gpu_egl_dispatcher() {
+    # The index's libEGL.so / libEGL.so.1 must be the REAL GLVND dispatcher.
+    #
+    # NVIDIA's driver ships its own copy of the GLVND EGL dispatcher and
+    # SymlinkProgram let it win the index symlink, so /usr/lib/libEGL.so.1
+    # became NVIDIA's fork while /usr/lib/libEGL.so stayed the real GLVND --
+    # two different dispatchers behind one SONAME.  The fork does not forward
+    # the GBM platform to the other vendors, so weston's drm-backend died with
+    #   Error: EGL does not support gbm platform.
+    #   fatal: failed to create compositor backend
+    # and the SDDM greeter never came up (black screen).  With the real
+    # GLVND the same weston gets a working EGL display (vendor "Mesa Project").
+    # The stock 017.01 ISO points libEGL.so.1 at the real GLVND
+    # (Programs/LibGLVnd/<v>) -- do the same, so both names point at ONE
+    # dispatcher again.
+    local egl real="" cur tgt l
+    for egl in "$TREE"/Programs/LibEGL/*/lib/libEGL.so.1.1.0 \
+               "$TREE"/Programs/LibGLVnd/*/lib/libEGL.so.1.1.0; do
+        [ -f "$egl" ] || continue
+        real="$egl"; break
+    done
+    if [ -z "$real" ]; then
+        say "EGL dispatcher: no GLVND libEGL.so.1.1.0 found in the tree (skipped)"
+        return 0
+    fi
+    tgt="/${real#$TREE/}"
+    for l in "$TREE/System/Index/lib/libEGL.so" "$TREE/System/Index/lib/libEGL.so.1"; do
+        [ -e "$l" ] || [ -L "$l" ] || continue
+        cur="$(readlink "$l" 2>/dev/null)"
+        [ "$cur" = "$tgt" ] && continue
+        ln -sfn "$tgt" "$l"
+        say "EGL dispatcher: ${l#$TREE/} -> $tgt (was ${cur:-a regular file})"
+    done
+    return 0
+}
+
+gpu_manifest_summary() {
+    # Report what every GPU loader will actually scan.  A manifest missing
+    # here is a silent runtime failure: "vulkaninfo" lists Intel only, EGL
+    # keeps Mesa, the NVIDIA stream platform is never loaded.
+    local rel d f n names
+    say "== GPU driver manifests (what the loaders will scan)"
+    for rel in vulkan/icd.d vulkan/implicit_layer.d vulkan/explicit_layer.d \
+               glvnd/egl_vendor.d egl/egl_external_platform.d; do
+        d="$TREE/System/Index/share/$rel"
+        if [ ! -d "$d" ] && [ ! -L "$d" ]; then
+            say "   $rel: MISSING"
+            continue
+        fi
+        n=0; names=""
+        for f in "$d"/*.json; do
+            # a link into /Programs/... only resolves inside the ISO
+            if [ -L "$f" ] || [ -e "$f" ]; then
+                n=$((n+1)); names="$names $(basename "$f")"
+            fi
+        done
+        if [ "$n" -eq 0 ]; then
+            say "   $rel: present but EMPTY"
+        else
+            say "   $rel: $n manifest(s):$names"
+        fi
+    done
+}
 
 SDDM_VER=$(basename "$(readlink "$TREE/Programs/SDDM/Current" 2>/dev/null || echo SDDM/0.18.1)")
 ELOGIND_VER=$(basename "$(readlink "$TREE/Programs/Elogind/Current" 2>/dev/null || echo Elogind/257.16)")
@@ -70,14 +258,19 @@ if ! grep -q '^live:' "$TREE/etc/passwd"; then
     echo "live:\$1\$YkWcMQvG\$srpADXE5KqFZDh8H1F./0/:19700:0:99999:7:::" >> "$TREE/etc/shadow"
     say "created live user 1000:1000"
 fi
-# membership pass (idempotent, comma-safe)
+# membership pass (idempotent, comma-safe): video/input for live+sddm, and wheel
+# (admin group; polkit/sudo conventions) for live only.
 python3 - "$TREE/etc/group" <<'PYEOF'
 import sys
 p = sys.argv[1]
 lines = open(p).read().splitlines()
 out = []
+have_wheel = False
+used_gids = set()
 for l in lines:
     f = l.split(':')
+    if len(f) >= 3 and f[2].isdigit():
+        used_gids.add(int(f[2]))
     if len(f) >= 4 and f[0] in ('video', 'input'):
         members = [m for m in f[3].split(',') if m]
         for u in ('live', 'sddm'):
@@ -85,8 +278,39 @@ for l in lines:
                 members.append(u)
         f[3] = ','.join(members)
         l = ':'.join(f)
+    elif len(f) >= 4 and f[0] == 'wheel':
+        # admin group: live only (never the sddm system user)
+        have_wheel = True
+        members = [m for m in f[3].split(',') if m]
+        if 'live' not in members:
+            members.append('live')
+        f[3] = ','.join(members)
+        l = ':'.join(f)
     out.append(l)
+if not have_wheel:
+    # conventional gid 10; if something else owns it, take the first free gid < 100
+    gid = 10 if 10 not in used_gids else next(g for g in range(11, 100) if g not in used_gids)
+    out.append('wheel:x:%d:live' % gid)
 open(p, 'w').write('\n'.join(out) + '\n')
+# gshadow (only if the image has one): keep it consistent with group
+import os
+gs = os.path.join(os.path.dirname(p), 'gshadow')
+if os.path.isfile(gs):
+    gl = open(gs).read().splitlines()
+    gout, seen = [], False
+    for l in gl:
+        f = l.split(':')
+        if len(f) >= 4 and f[0] == 'wheel':
+            seen = True
+            members = [m for m in f[3].split(',') if m]
+            if 'live' not in members:
+                members.append('live')
+            f[3] = ','.join(members)
+            l = ':'.join(f)
+        gout.append(l)
+    if not seen:
+        gout.append('wheel:!::live')
+    open(gs, 'w').write('\n'.join(gout) + '\n')
 PYEOF
 mkdir -p "$TREE/var/lib/sddm" "$TREE/Users/live"
 chown 63:63 "$TREE/var/lib/sddm" 2>/dev/null || true
@@ -219,21 +443,50 @@ GLR
     say "created greeter/session log wrapper ${gobo_log_run#$TREE/}"
 fi
 
-# waitdrm <command...>: wait up to 30s for /dev/dri/card0, then exec <command...>.
+# waitdrm <command...>: wait up to 30s for /dev/dri/card0, then run <command...>.
 # On QEMU the virtio-gpu node appears a couple seconds AFTER sddm launches the
 # greeter compositor; weston's auto-selected backend then silently falls back to
 # headless-backend (Output 'headless', no cursor planes) and the login screen is
 # blank.  The compositor is started with an explicit --backend=drm below, but
 # only AFTER the DRM card exists.
+#
+# A GPU that cannot give EGL a GBM display (QEMU virtio-vga without virgl, a
+# driver without GBM support, a broken EGL stack) makes weston's drm-backend die
+# with
+#   Error: EGL does not support gbm platform.
+#   fatal: failed to create compositor backend
+# and the greeter stays a BLACK screen with a blinking cursor forever: the
+# compositor never comes up, so there is nothing to draw the login UI on.
+# Retry such a weston with --use-pixman -- weston's software renderer needs no
+# EGL at all, so the login screen appears even where the GPU cannot do GL.
+# QT_QUICK_BACKEND=software is set for that retry only (the greeter's QML then
+# renders through wl_shm instead of EGL); on a GPU that works the GL renderer
+# is used and the greeter keeps its full quality.
 waitdrm="$sddm_scripts/waitdrm"
-if [ ! -x "$waitdrm" ]; then
+if [ ! -x "$waitdrm" ] || ! grep -q 'use-pixman' "$waitdrm" 2>/dev/null; then
     cat > "$waitdrm" <<'WAIT'
 #!/bin/bash
+# waitdrm <command...>: wait for the DRM card, then run <command...>.
 for i in $(seq 1 30); do
     [ -e /dev/dri/card0 ] && break
     sleep 1
 done
-exec "$@"
+
+"$@"
+rc=$?
+
+is_weston=0
+for a in "$@"; do
+    case "${a##*/}" in weston) is_weston=1 ;; esac
+done
+
+if [ "$rc" -ne 0 ] && [ "$is_weston" = 1 ]; then
+    echo "waitdrm: weston failed (rc=$rc) -- retrying with the pixman software renderer" >&2
+    # The greeter's QML must not need EGL either -> render it in software.
+    export QT_QUICK_BACKEND=software
+    exec "$@" --use-pixman
+fi
+exit $rc
 WAIT
     chmod 755 "$waitdrm"
     say "created greeter compositor guard ${waitdrm#$TREE/}"
@@ -260,16 +513,23 @@ InputMethod=
 [Theme]
 # SDDM 0.20.0's sddm-greeter here is built against Qt 5.15.2, so the Plasma 6
 # Breeze SDDM theme can NEVER load: its QML uses versionless imports
-# (`import QtQuick.Controls`, `org.kde.plasma.components`, `org.kde.kirigami`)
+# ("import QtQuick.Controls", "org.kde.plasma.components", "org.kde.kirigami")
 # which are Qt6-only -> every import fails -> "Fallback to embedded theme" ->
 # a near-black screen with only the qtvirtualkeyboard overlay (no wallpaper,
 # no username/password fields).  Don't chase this: use one of SDDM's OWN
 # Qt5-compatible themes (elarun/maldives/maya ship in the SDDM install prefix
 # and render fine under the Qt5 greeter).  maya is full-screen, has the
 # session/user/password UI, and was validated by logging into Plasma from it.
-# ThemeDir defaults to the SDDM prefix dir; keep it explicit ($SDDM_VER expands
-# because this heredoc is unquoted).
-ThemeDir=/Programs/SDDM/$SDDM_VER/share/sddm/themes
+# The KDE SDDM config module (sddm-kcm) lists themes from
+# QStandardPaths(GenericDataLocation)/sddm/themes (== /usr/share/sddm/themes)
+# and its installer (kcmsddm_authhelper) unpacks into that SAME standard path
+# -- NOT into the SDDM install prefix.  If ThemeDir pointed at the prefix
+# dir here instead, themes installed from KDE System Settings would never
+# show up in the greeter (this dir) NOR back in the KCM's list (their dir).
+# Canonicalize on the KCM's standard path: it is writable via the live
+# overlay and already carries the stock SDDM themes (materialized by the
+# build).  No themes are pre-baked by this script.
+ThemeDir=/usr/share/sddm/themes
 Current=maya
 
 [Users]
@@ -294,7 +554,7 @@ SessionLogFile=/Data/Variable/log/sddm-wayland-session.log
 CompositorCommand=/usr/share/sddm/scripts/gobo-log-run /Data/Variable/log/sddm-weston.log /usr/share/sddm/scripts/waitdrm weston --backend=drm --seat=seat0 --shell=fullscreen-shell.so
 
 # Login screen, no autologin: the LiveCD boots to the SDDM greeter where the
-# user logs in as `live` (password `live`, NOPASSWD sudo -> root for
+# user logs in as "live" (password "live", NOPASSWD sudo -> root for
 # GParted / Gobo installer).  Re-enable for a touch-free desktop boot.
 # [Autologin]
 # User=live
@@ -302,7 +562,8 @@ CompositorCommand=/usr/share/sddm/scripts/gobo-log-run /Data/Variable/log/sddm-w
 # Relogin=true
 EOF
 cp -f "$sddm_conf_dir/sddm.conf" "$SYSTEMDDM_SYSCONF"
-[ -e "$TREE/etc/sddm.conf" ] || ln -s "/Programs/SDDM/$SDDM_VER/Resources/Defaults/Settings/sddm.conf" "$TREE/etc/sddm.conf"
+[ -e "$TREE/etc/sddm.conf" ] || [ -L "$TREE/etc/sddm.conf" ] || \
+    ln -s "/Programs/SDDM/$SDDM_VER/Resources/Defaults/Settings/sddm.conf" "$TREE/etc/sddm.conf"
 # sddm persists the last-session name (and autologin pact) in /var/lib/sddm;
 # a leftover state.conf/Users stash from an earlier pantheon-autologin boot
 # overrides our Session=plasma.desktop on the NEXT boot (RememberLastSession).
@@ -323,6 +584,27 @@ User=live
 EOF
 say "sddm: seeded state.conf (Session=plasma.desktop, User=live) so the greeter preselects Plasma for user live"
 say "wrote sddm.conf (DisplayServer=wayland, Session=plasma.desktop in state, Theme=maya, InputMethod off), purged old sddm state"
+
+# --- 6d) PowerDevil D-Bus activation (Leave menu Shut Down / Restart) ---------
+# Plasma 6 starts powerdevil when something activates the
+# org.kde.Solid.PowerManagement session service; with none of that service
+# registered, no component ever launches the daemon, Solid reports its power
+# actions unavailable, and the Application Menu's Leave submenu drops the
+# power options (only Log Out remains).  The Powerdevil program ships the
+# daemon (as org_kde_powerdevil, symlinked through System/Index/libexec) and
+# the KAuth helper system-services, but NOT the session [D-BUS Service] file
+# this activation depends on.  Provide it in the standard session-bus
+# servicedir (session.conf uses <standard_session_servicedirs/>).
+powerdevil_svc="$TREE/usr/share/dbus-1/services/org.kde.Solid.PowerManagement.service"
+if [ ! -f "$powerdevil_svc" ]; then
+    mkdir -p "$(dirname "$powerdevil_svc")"
+    cat > "$powerdevil_svc" <<'PDEVD'
+[D-BUS Service]
+Name=org.kde.Solid.PowerManagement
+Exec=/System/Index/libexec/org_kde_powerdevil
+PDEVD
+    say "powerdevil: added org.kde.Solid.PowerManagement D-Bus activation (Leave menu power options)"
+fi
 
 # --- 6a) udev: expose input devices to the input group -------------------------
 # devtmpfs (the kernel) creates /dev/input/* as 0600 root:root at EVERY boot,
@@ -462,7 +744,7 @@ do
 done
 
 # --- 10) python symlink ---------------------------------------------------------
-if [ ! -e "$TREE/System/Index/bin/python" ]; then
+if [ ! -e "$TREE/System/Index/bin/python" ] && [ ! -L "$TREE/System/Index/bin/python" ]; then
     ln -s python3 "$TREE/System/Index/bin/python" 2>/dev/null && say "python -> python3"
 fi
 
@@ -496,7 +778,7 @@ case "$1" in
         printf '!! elogind START skipped: binary missing/unresolvable ELG=%s\n' "$ELG" >> "$ELOG"
         exit 1
     fi
-    pgrep -xc elogind >/dev/null 2>&1 && exit 0
+    pgrep -xc elogind-daemon >/dev/null 2>&1 && exit 0
     mkdir -p /run/user
     # elogind --daemon self-daemonizes (double-fork, detaches session/fds);
     # background it so the boot Exec line returns instead of blocking. Plain &
@@ -509,15 +791,15 @@ case "$1" in
     # --daemon can exit if it cannot register on the system bus on first try.
     # Give it a short window and verify it actually survived, then retry once.
     for _e in 1 2 3 4 5 6 7 8; do
-        pgrep -xc elogind >/dev/null 2>&1 && break
+        pgrep -xc elogind-daemon >/dev/null 2>&1 && break
         sleep 1
     done
-    if ! pgrep -xc elogind >/dev/null 2>&1; then
+    if ! pgrep -xc elogind-daemon >/dev/null 2>&1; then
         printf '  !! elogind not running after start; log tail:\n' >> "$ELOG"
         tail -n 30 "$ELOG" >> "$ELOG"
         exit 1
     fi
-    printf '  elogind running (pid %s)\n' "$(pgrep -xc elogind)" >> "$ELOG"
+    printf '  elogind running (pid %s)\n' "$(pgrep -x elogind-daemon)" >> "$ELOG"
     # elogind normally creates /run/user/<uid> for logged-in users via a login
     # manager, but the LiveCD has no logind session manager, so pre-create the
     # `live` user's XDG_RUNTIME_DIR ourselves (sway/gala/weston refuse to start
@@ -711,7 +993,7 @@ if [ -f "$sld" ]; then
 ########################################
 msg "Starting display manager"
 StartTask SDDM
-echo "  live-boot report: sshd=$(pgrep -xc sshd || echo 0) sddm=$(pgrep -xc sddm || echo 0) seatd=$(pgrep -xc seatd || echo 0) elogind=$(pgrep -xc elogind || echo 0)"
+echo "  live-boot report: sshd=$(pgrep -xc sshd || echo 0) sddm=$(pgrep -xc sddm || echo 0) seatd=$(pgrep -xc seatd || echo 0) elogind=$(pgrep -xc elogind-daemon || echo 0)"
 echo "  overlay /run free: $(df -P /run 2>/dev/null | awk 'NR==2{print $4}') K"
 EOF
         say "  greeter startup appended to ${sld#$TREE/}"
@@ -771,8 +1053,20 @@ say "installed BootDiagnostics task + DEBUG=1"
 helper_target="$TREE/System/Index/lib/dbus-daemon-launch-helper"
 if [ -e "$helper_target" ]; then
     for d in usr/lib/dbus-1.0 usr/lib/dbus-1 lib/dbus-1; do
-        mkdir -p "$TREE/$d"
-        [ -e "$TREE/$d/dbus-daemon-launch-helper" ] || ln -s /System/Index/lib/dbus-daemon-launch-helper "$TREE/$d/dbus-daemon-launch-helper"
+        # usr/lib/dbus-1.0 is a GoboLinux Settings-style ABSOLUTE symlink
+        # (/Programs/DBus/<ver>/lib/dbus-1.0): host-dangling, so mkdir -p would
+        # hit "File exists" and the ln would die "No such file or directory".
+        # Translate the link target back under $TREE and write the real file.
+        ddir="$TREE/$d"
+        if [ -L "$ddir" ]; then
+            dlt=$(readlink "$ddir")
+            case "$dlt" in /*) ddir="$TREE$dlt";; esac
+        fi
+        mkdir -p "$ddir"
+        # -e follows the link: an existing link to the ISO-only helper is
+        # host-dangling, so a plain -e guard would re-ln and hit "File exists".
+        [ -e "$ddir/dbus-daemon-launch-helper" ] || [ -L "$ddir/dbus-daemon-launch-helper" ] || \
+            ln -sfn /System/Index/lib/dbus-daemon-launch-helper "$ddir/dbus-daemon-launch-helper"
     done
     say "dbus launch helper linked into FHS paths"
 fi
@@ -805,8 +1099,10 @@ fi
 # Ensure libgala and libmutter-16 are in the Index (should already exist from
 # Compile, but be idempotent).
 for so in libgala.so libgala.so.0 libmutter-16.so libmutter-16.so.0; do
-    [ -e "$idx_lib/$so" ] || \
-        ln -s "/Programs/Gala/$gala_ver/lib/$so" "$idx_lib/$so" 2>/dev/null || \
+    # Skip when any link already exists: a link to an ISO-only target is
+    # host-dangling, so -e is false and a bare ln -s would hit "File exists".
+    { [ -e "$idx_lib/$so" ] || [ -L "$idx_lib/$so" ]; } && continue
+    ln -s "/Programs/Gala/$gala_ver/lib/$so" "$idx_lib/$so" 2>/dev/null || \
         ln -s "/Programs/Mutter/$mutter_ver/lib/$so" "$idx_lib/$so" 2>/dev/null || true
 done
 
@@ -895,7 +1191,7 @@ for scr in "Xsession" "wayland-session"; do
     fi
 done
 
-# --- 13e) D-Bus system policy: elogind + polkit own their bus names ------------
+# --- 13e) D-Bus system policy: elogind + polkit + KAuth helpers own their names ----
 # The running dbus reads /System/Settings/dbus-1/system.d (this ISO's
 # system.conf includedir) — NOT /etc/dbus-1 or Index/share/dbus-1.  Both
 # elogind and polkit install their <name>.conf into Programs/<prog>/<ver>/share/
@@ -904,11 +1200,18 @@ done
 #              exit; sddm-helper then fails VT takeover ("Operation not
 #              permitted") because no logind manages the seat.
 #   * polkitd: cannot own org.freedesktop.PolicyKit1 -> pkexec/agent dead.
+#   * kcmsddm / every KAuth 6 helper: default policy is <deny own="*"/>, so the
+#     root helper cannot own its name -> dbus activation of the KCM service
+#     fails with "not allowed to own the service ... due to security policies"
+#     -> "Launch helper exited with unknown return code 255" (the old SDDM
+#     theme-install error #2, after the FAKE-backend fix).  install_kcmsddm_
+#     dbusconf emits the SDDM-KCM conf into its Program tree; link it here too.
 # Link each into its Program Settings tree (so a future merge repopulates the
 # includedir) and directly into System/Settings/dbus-1/system.d.
 for pair in \
     "Elogind:org.freedesktop.login1" \
-    "Polkit:org.freedesktop.PolicyKit1"; do
+    "Polkit:org.freedesktop.PolicyKit1" \
+    "SDDM-KCM:org.kde.kcontrol.kcmsddm"; do
     prog=${pair%%:*}; name=${pair#*:}
     ver=$(basename "$(readlink "$TREE/Programs/$prog/Current" 2>/dev/null)")
     src="$TREE/Programs/$prog/$ver/share/dbus-1/system.d/$name.conf"
@@ -972,9 +1275,10 @@ mkdir -p "$lib32_index"
 lib32_count=0
 for libdir in "$TREE"/Programs/Lib32-*/*/lib32 \
               "$TREE"/Programs/Glibc-32/*/lib32 \
+              "$TREE"/Programs/Nvidia-Utils/*/lib32 \
               "$TREE"/Programs/Nvidia/*/lib32; do
     [ -d "$libdir" ] || continue
-    for f in "$libdir"/lib*.so*; do
+    for f in "$libdir"/lib*.so* "$libdir"/ld-*.so* "$libdir"/ld-linux*; do
         [ -e "$f" ] || continue
         bn=$(basename "$f")
         # Symlink target must be relative to / (the live rootfs), not $TREE.
@@ -1102,15 +1406,237 @@ HEROICEOF
     say "Heroic .desktop + icon installed"
 fi
 
-# NVIDIA Settings — .desktop and icon exist in Programs but aren't linked
-nvidia_desktop="$TREE/Programs/Nvidia/580.159.04/Shared/applications/nvidia-settings.desktop"
-nvidia_icon="$TREE/Programs/Nvidia/580.159.04/Shared/pixmaps/nvidia-settings.png"
-if [ -f "$nvidia_desktop" ] && [ ! -e "$TREE/usr/share/applications/nvidia-settings.desktop" ]; then
+# --- XIVLauncher: fix Velopack layout + wrapper + env (XIVLAUNCHER-*) --------
+xiv_cur="$TREE/Programs/FFXIVQuickLauncher/Current"
+if [ -d "$xiv_cur" ]; then
+    xiv_wrap="$xiv_cur/bin/xivlauncher"
+    xiv_ver="$(basename "$(readlink -f "$xiv_cur" 2>/dev/null || echo 7.0.20)")"
+    need_fix=0
+    if [ -f "$xiv_wrap" ]; then
+        ! grep -q "XL_WINEONLINUX" "$xiv_wrap" 2>/dev/null && need_fix=1
+    fi
+    legacy_app="$xiv_cur/lib/xivlauncher"
+    vlroot="$xiv_cur/velopack"
+    appdir="$vlroot/app-$xiv_ver"
+    app="$appdir/XIVLauncher.exe"
+    if [ ! -f "$app" ] && [ -f "$legacy_app/XIVLauncher.exe" ]; then
+        need_fix=1
+    fi
+    # A payload nested one level too deep (app-<ver>/xivlauncher/XIVLauncher.exe)
+    # is what the PREVIOUS buggy build produced: it fails the wrapper's
+    # `[ -f "$APP" ]` guard, so treat it as needing repair and self-heal below.
+    if [ ! -f "$app" ] && [ -f "$appdir/xivlauncher/XIVLauncher.exe" ]; then
+        need_fix=1
+    fi
+    if [ -f "$app" ]; then
+        [ -f "$appdir/sq.version" ] || need_fix=1
+    fi
+    if [ "$need_fix" -eq 1 ]; then
+        # NOTE: do NOT pre-create "$appdir".  `mv` must *rename* lib/xivlauncher
+        # -> app-<ver>; creating app-<ver> first made mv nest the payload as
+        # app-<ver>/xivlauncher/ and the wrapper then aborted with
+        # "application payload not found".  (Mirrors the recipe's pre_install.)
+        mkdir -p "$vlroot" "$vlroot/packages"
+        if [ ! -f "$app" ] && [ -f "$legacy_app/XIVLauncher.exe" ]; then
+            rm -rf "$appdir"
+            mv "$legacy_app" "$appdir"
+        fi
+        # Self-heal a payload a previous build already nested one level deep.
+        if [ ! -f "$app" ] && [ -f "$appdir/xivlauncher/XIVLauncher.exe" ]; then
+            ( shopt -s dotglob; cp -a "$appdir/xivlauncher/." "$appdir"/ )
+            rm -rf "$appdir/xivlauncher"
+        fi
+        mkdir -p "$appdir"
+        [ -f "$vlroot/Update.exe" ] || : > "$vlroot/Update.exe"
+        if [ ! -f "$appdir/sq.version" ]; then
+            cat > "$appdir/sq.version" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>XIVLauncher</id>
+    <version>$xiv_ver</version>
+    <title>XIVLauncher</title>
+    <authors>goatcorp</authors>
+    <owners>goatcorp</owners>
+    <description>XIVLauncher</description>
+  </metadata>
+</package>
+EOF
+        fi
+        cat > "$xiv_wrap" <<'XIVLWRAP'
+#!/bin/bash
+DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+VER="$(basename "$(readlink -f "$DIR/../Current" 2>/dev/null || echo "$DIR")")"
+if ! echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then VER="$(basename "$(readlink "$DIR/../Current" 2>/dev/null || echo "7.0.20")")"; fi
+[ -n "$VER" ] || VER=7.0.20
+
+WINE="${WINE:-}"
+if [ -z "$WINE" ]; then
+    for cand in "/Programs/Wine-Lutris-GE/Current/bin/wine" \
+                "/Programs/Wine/Current/bin/wine" \
+                "$(command -v wine 2>/dev/null)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] && WINE="$cand" && break
+    done
+fi
+[ -n "$WINE" ] || { echo "xivlauncher: no wine found"; exit 1; }
+
+WINEPREFIX="${WINEPREFIX:-$HOME/.local/share/wineprefixes/xivlauncher}"
+export WINEPREFIX WINEDEBUG="${WINEDEBUG:--all}"
+export XL_WINEONLINUX="${XL_WINEONLINUX:-true}"
+export XL_NO_RUNAS="${XL_NO_RUNAS:-true}"
+export XL_NO_SPACE_REQUIREMENTS="${XL_NO_SPACE_REQUIREMENTS:-true}"
+
+if [ ! -d "$WINEPREFIX/drive_c" ]; then
+    echo "Initializing Wine prefix $WINEPREFIX"
+    mkdir -p "$WINEPREFIX"
+    "$WINE" wineboot --init 2>/dev/null
+fi
+
+LEGACY_APP="$DIR/lib/xivlauncher"
+VLROOT="$DIR/velopack"
+APPDIR="$VLROOT/app-$VER"
+APP="$APPDIR/XIVLauncher.exe"
+
+if [ ! -f "$APP" ] && [ -f "$LEGACY_APP/XIVLauncher.exe" ]; then
+    mkdir -p "$VLROOT"
+    mv "$LEGACY_APP" "$APPDIR"
+fi
+
+if [ -f "$APP" ]; then
+    mkdir -p "$VLROOT/packages"
+    [ -f "$VLROOT/Update.exe" ] || : > "$VLROOT/Update.exe"
+    [ -f "$APPDIR/sq.version" ] || cat > "$APPDIR/sq.version" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>XIVLauncher</id>
+    <version>$VER</version>
+    <title>XIVLauncher</title>
+    <authors>goatcorp</authors>
+    <owners>goatcorp</owners>
+    <description>XIVLauncher</description>
+  </metadata>
+</package>
+EOF
+fi
+
+rm -f "$WINEPREFIX/.gobo-cacert-imported"
+
+[ -f "$APP" ] || { echo "xivlauncher: application payload not found under $DIR"; exit 1; }
+
+exec "$WINE" "$APP" "$@"
+XIVLWRAP
+        chmod +x "$xiv_wrap"
+        say "XIVLauncher: Velopack layout + fixed wrapper + env applied to $xiv_cur"
+    fi
+
+    # --- section 60 guard: ensure the frontier news retry proxy is running ----
+    # The proxy is normally started at boot (StartLiveCD -> System/Tasks/
+    # FrontierRetry).  As a best-effort fallback for a boot that skipped that,
+    # inject a non-blocking guard into the launcher wrapper that starts the task
+    # via the live user's passwordless sudo ("sudo -n", so it never prompts).
+    if [ -f "$xiv_wrap" ] && ! grep -q 'frontier-retry guard' "$xiv_wrap"; then
+        frblk="$(mktemp)"
+        cat > "$frblk" <<'XIVL_FRGUARD'
+# frontier-retry guard (livefix section 60): ensure the local retrying front
+# for frontier.ffxiv.com is running before XIVLauncher starts.  Normally started
+# at boot by StartLiveCD -> System/Tasks/FrontierRetry; this is a best-effort
+# fallback (passwordless sudo; never blocks or prompts).
+if ! pgrep -f /System/Settings/frontier-retry/frontier-retry.py >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1 && [ -x /System/Tasks/FrontierRetry ]; then
+        sudo -n /System/Tasks/FrontierRetry start >/dev/null 2>&1 || true
+    fi
+fi
+XIVL_FRGUARD
+        if awk -v blk="$frblk" '
+              !done && /^exec / { while ((getline l < blk) > 0) print l; close(blk); done = 1 }
+              { print }
+              END { exit(done ? 0 : 1) }
+            ' "$xiv_wrap" > "$xiv_wrap.livefix.tmp"; then
+            cat "$xiv_wrap.livefix.tmp" > "$xiv_wrap"
+            rm -f "$xiv_wrap.livefix.tmp" "$frblk"
+            chmod +x "$xiv_wrap"
+            say "XIVLauncher: injected frontier-retry guard into wrapper"
+        else
+            rm -f "$xiv_wrap.livefix.tmp" "$frblk"
+            say "!!! XIVLauncher: no 'exec ' line found in wrapper; skipped frontier-retry guard"
+        fi
+    fi
+fi
+
+# NVIDIA Settings — .desktop and icon exist in Programs but aren't linked.
+# Uses Current (not a hard-coded version) so this survives driver bumps.
+# Since the Arch-style split the authoritative copies come from the standalone
+# Nvidia-Settings program; older trees still carry them inside Nvidia, so
+# prefer Nvidia-Settings and fall back to Nvidia.
+#
+# The recipe now installs them into share/ (share/applications +
+# share/pixmaps), which is what SymlinkProgram links into
+# /System/Index/share -- so on a freshly merged tree the launcher and the icon
+# are ALREADY in place and this block is a no-op. The "Shared/" paths are kept
+# as a fallback for trees merged from older packages, and the index-level
+# stale-entry cleanup below handles the 580 -> 615 migration leftovers.
+nvidia_desktop=""
+nvidia_icon=""
+for cand in \
+    "$TREE/Programs/Nvidia-Settings/Current/share/applications/nvidia-settings.desktop" \
+    "$TREE/Programs/Nvidia-Settings/Current/Shared/applications/nvidia-settings.desktop" \
+    "$TREE/Programs/Nvidia/Current/share/applications/nvidia-settings.desktop" \
+    "$TREE/Programs/Nvidia/Current/Shared/applications/nvidia-settings.desktop"
+do
+    if [ -f "$cand" ]; then nvidia_desktop="$cand"; break; fi
+done
+for cand in \
+    "$TREE/Programs/Nvidia-Settings/Current/share/pixmaps/nvidia-settings.png" \
+    "$TREE/Programs/Nvidia-Settings/Current/Shared/pixmaps/nvidia-settings.png" \
+    "$TREE/Programs/Nvidia/Current/share/pixmaps/nvidia-settings.png" \
+    "$TREE/Programs/Nvidia/Current/Shared/pixmaps/nvidia-settings.png"
+do
+    if [ -f "$cand" ]; then nvidia_icon="$cand"; break; fi
+done
+
+# Drop a stale index entry left over from the 580.159.04 stack: it points at
+# /Programs/Nvidia/580.159.04/Shared/applications/nvidia-settings.desktop,
+# which no longer exists. update-desktop-database (run by SymlinkProgram on
+# every package with a share/applications dir) chokes on the dangling link
+# with 'Could not parse file ".../nvidia-settings.desktop": No such file or
+# directory'. A dangling symlink is removed with -f, a real file is kept.
+nvidia_index_entry="$TREE/usr/share/applications/nvidia-settings.desktop"
+if [ -L "$nvidia_index_entry" ] && [ ! -e "$nvidia_index_entry" ]; then
+    rm -f "$nvidia_index_entry"
+    say "NVIDIA Settings: removed stale dangling index entry"
+fi
+
+if [ -n "$nvidia_desktop" ]; then
     mkdir -p "$TREE/usr/share/applications" "$TREE/usr/share/pixmaps"
-    ln -sf "/${nvidia_desktop#$TREE/}" "$TREE/usr/share/applications/nvidia-settings.desktop"
-    [ -f "$nvidia_icon" ] && \
-        ln -sf "/${nvidia_icon#$TREE/}" "$TREE/usr/share/pixmaps/nvidia-settings.png"
+    # Always refresh the link so a version bump cannot leave a dead launcher.
+    ln -sfn "/${nvidia_desktop#$TREE/}" "$nvidia_index_entry"
+    # The icon must be reachable through /usr/share/pixmaps: the launcher's
+    # Icon= key is the bare theme name "nvidia-settings" (upstream's own
+    # layout), and that is where KDE/Plasma resolves it from.
+    if [ -n "$nvidia_icon" ]; then
+        ln -sfn "/${nvidia_icon#$TREE/}" "$TREE/usr/share/pixmaps/nvidia-settings.png"
+    fi
     say "NVIDIA Settings .desktop + icon linked"
+
+    # The old tarballs still carry the launcher in a "Shared/" dir, which Gobo
+    # ignores. Once the share/ layout is in place those copies are dead
+    # weight -- and the driver one has a VERSION-PINNED Exec
+    # (/Programs/Nvidia/615.71.09/bin/nvidia-settings) that dies on the next
+    # driver bump. Drop them so only the share/ launcher remains.
+    case "$nvidia_desktop" in
+        */share/applications/nvidia-settings.desktop)
+            for stale in "$TREE/Programs/Nvidia/Current/Shared" \
+                         "$TREE/Programs/Nvidia-Settings/Current/Shared"
+            do
+                if [ -d "$stale" ] && [ -e "$stale/applications/nvidia-settings.desktop" ]
+                then
+                    rm -rf "$stale"
+                    say "NVIDIA Settings: removed stale Shared/ launcher tree (${stale#$TREE/})"
+                fi
+            done
+            ;;
+    esac
 fi
 
 # --- 14b2) NVIDIA runtime enablement (pre-580-fix ISOs) ----------------------
@@ -1121,25 +1647,47 @@ fi
 # Current recipes package them (do_install -> Resources/Unmanaged); for trees
 # merged from older packages, lay the same three files down here (idempotent).
 say "NVIDIA runtime enablement (enable driver at boot)"
-if [ ! -s "$TREE/etc/modprobe.d/nvidia.conf" ] || \
-   ! grep -q '^options nvidia-drm modeset=1' "$TREE/etc/modprobe.d/nvidia.conf" 2>/dev/null; then
-    mkdir -p "$TREE/etc/modprobe.d"
-    printf 'blacklist nouveau\noptions nvidia-drm modeset=1 fbdev=1\n' \
-        > "$TREE/etc/modprobe.d/nvidia.conf"
-    say "NVIDIA /etc/modprobe.d/nvidia.conf written (nouveau blacklist + modeset)"
+# /etc/modprobe.d is a GoboLinux Settings symlink whose target is ABSOLUTE
+# (/Programs/...), so it only resolves inside the ISO -- on the host build tree
+# it dangles, making mkdir -p fail ("File exists") and the redirect below die
+# ("No such file or directory").  Translate the link target back under $TREE so
+# we read/write the real in-tree file.
+nv_moddir="$TREE/etc/modprobe.d"
+if [ -L "$nv_moddir" ]; then
+    nv_lt=$(readlink "$nv_moddir")
+    case "$nv_lt" in /*) nv_moddir="$TREE$nv_lt";; esac
 fi
-if [ ! -e "$TREE/etc/udev/rules.d/60-nvidia.rules" ] || \
-   ! grep -q '0x10de' "$TREE/etc/udev/rules.d/60-nvidia.rules" 2>/dev/null; then
+if [ ! -s "$nv_moddir/nvidia.conf" ] || \
+   ! grep -q '^options nvidia-drm modeset=1' "$nv_moddir/nvidia.conf" 2>/dev/null; then
+    mkdir -p "$nv_moddir"
+    printf 'blacklist nouveau\noptions nvidia-drm modeset=1 fbdev=1\n' \
+        > "$nv_moddir/nvidia.conf"
+    say "NVIDIA modprobe.d/nvidia.conf written (nouveau blacklist + modeset)"
+fi
+if [ -e "$TREE/etc/udev/rules.d/60-nvidia.rules" ]; then
+    # The packaged 60-nvidia.rules are dead under eudev: a shell-variable RUN
+    # ($PCIEVENT, "unknown key") and nvidia-modprobe -d (which this 580 build
+    # does not provide) are both dropped, so the stack never auto-loads at boot.
+    # Repair in place (NVIDIA-EGL-Wayland-issues.md Fix 2 step 3): replace the
+    # variable RUN with the verbatim command and drop the bogus -d.
+    R="$TREE/etc/udev/rules.d/60-nvidia.rules"
+    if grep -qE 'RUN\+=\$PCIEVENT|nvidia-modprobe -c 0 -d' "$R" 2>/dev/null; then
+        sed -i \
+            -e '/^PCIEVENT=/d' \
+            -e 's#RUN+=\$PCIEVENT#RUN+="/usr/bin/nvidia-modprobe -c 0 -m -u"#g' \
+            -e 's#nvidia-modprobe -c 0 -d#nvidia-modprobe -c 0 -m#g' \
+            "$R"
+        say "NVIDIA 60-nvidia.rules repaired (eudev-safe RUN, no -d)"
+    fi
+else
     mkdir -p "$TREE/etc/udev/rules.d"
-    [ -e "$TREE/etc/udev/rules.d/60-nvidia.rules" ] || : > "$TREE/etc/udev/rules.d/60-nvidia.rules"
-    cat >> "$TREE/etc/udev/rules.d/60-nvidia.rules" <<'NVRU'
+    cat > "$TREE/etc/udev/rules.d/60-nvidia.rules" <<'NVRU'
 # Boot-time load of the nvidia driver stack on real NVIDIA hardware (missing
-# in pre-580-fix packages; the KERNEL== rules below only fire post-insert).
-PCIEVENT="/bin/sh -c '/usr/bin/nvidia-modprobe -c 0 -m -u -d >/dev/null 2>&1 || true'"
-SUBSYSTEM=="pci", ACTION=="add", ATTRS{vendor}=="0x10de", ATTR{class}=="0x030000", RUN+=$PCIEVENT
-SUBSYSTEM=="pci", ACTION=="add", ATTRS{vendor}=="0x10de", ATTR{class}=="0x030200", RUN+=$PCIEVENT
+# in pre-580-fix packages; eudev-safe: no shell variables, no nvidia-modprobe -d).
+SUBSYSTEM=="pci", ACTION=="add", ATTRS{vendor}=="0x10de", ATTR{class}=="0x030000", RUN+="/usr/bin/nvidia-modprobe -c 0 -m -u"
+SUBSYSTEM=="pci", ACTION=="add", ATTRS{vendor}=="0x10de", ATTR{class}=="0x030200", RUN+="/usr/bin/nvidia-modprobe -c 0 -m -u"
 NVRU
-    say "NVIDIA udev PCI auto-load rules appended to 60-nvidia.rules"
+    say "NVIDIA 60-nvidia.rules created (eudev-safe PCI auto-load rules)"
 fi
 if [ ! -e "$TREE/usr/share/X11/xorg.conf.d/10-nvidia.conf" ]; then
     mkdir -p "$TREE/usr/share/X11/xorg.conf.d"
@@ -1156,6 +1704,122 @@ EndSection
 NVC
     say "NVIDIA Xorg OutputClass written to /usr/share/X11/xorg.conf.d/10-nvidia.conf"
 fi
+
+# --- 14b3) NVIDIA EGL/Wayland device-node + glvnd + hybrid fixes ------------
+# (NVIDIA-EGL-Wayland-issues.md: RC1/RC2/RC3)
+# RC1: the GPU char devices (/dev/nvidiactl, /dev/nvidia0) were never created,
+#      so the whole userspace stack (nvidia-smi, nvidia-settings, KWin EGL,
+#      portal screencast, polkit-agent) finds no GPU.  The shipped
+#      60-nvidia.rules is dead under eudev (-d isn't a valid RUN key and -c 0
+#      skips the nvidiactl node) and its PCIEVENT var line never resolves.  The
+#      580 package SHIPS a ready, self-gating task (no-op unless an NVIDIA PCI
+#      device is present); link it into /System/Tasks and start it in both boot
+#      paths right after seatd, so the nodes exist before sddm/the greeter run.
+nv_task_src="$TREE/Programs/Nvidia/Current/Resources/Tasks/NvidiaCtl"
+if [ -e "$nv_task_src" ]; then
+    if { [ -e "$TREE/System/Tasks/NvidiaCtl" ] || [ -L "$TREE/System/Tasks/NvidiaCtl" ]; }; then
+        say "NVIDIA NvidiaCtl task already wired in /System/Tasks"
+    else
+        mkdir -p "$TREE/System/Tasks"
+        ln -s "${nv_task_src#$TREE}" "$TREE/System/Tasks/NvidiaCtl"
+        say "NVIDIA NvidiaCtl task linked into /System/Tasks"
+    fi
+else
+    say "NVIDIA NvidiaCtl task not found ($nv_task_src); task wiring skipped"
+fi
+if [ -f "$bootup" ] && ! grep -q 'StartTask NvidiaCtl' "$bootup"; then
+    sed -i '/^Exec .*SeatD Start/a Exec "Creating NVIDIA device nodes..."      StartTask NvidiaCtl' "$bootup"
+    say "BootUp: NvidiaCtl StartTask added right after SeatD Start"
+fi
+if [ -f "$sld" ] && ! grep -q 'StartTask NvidiaCtl' "$sld"; then
+    sed -i '/^StartTask SeatD/a\msg "Creating NVIDIA device nodes"\nStartTask NvidiaCtl' "$sld"
+    say "StartLiveCD: NvidiaCtl StartTask added right after SeatD Start"
+fi
+# RC2: the force-nvidia-glvnd block sets __EGL_VENDOR_LIBRARY_FILENAMES to the
+#      nvidia JSONs ONLY, stripping Mesa's vendor file -> glvnd has no provider
+#      for anything vended through Mesa (iGPU despite an NVIDIA dGPU) and KWin
+#      falls back to software compositing.  The SHIPPED session scripts contain
+#      no such block at all, so the old sed (which patched the literal
+#      `20_nvidia_xlib.json"`) silently no-op'd.  Inject a self-gating block
+#      instead: when a card reports DRIVER=nvidia|nouveau it appends Mesa's
+#      50_mesa.json to any restricted vendor list (md Fix 3 option B), and when
+#      no override is set it leaves glvnd's default directory scan untouched
+#      (which already carries 50_mesa.json via block 19) -- i.e. the doc's
+#      "drop the override entirely" behaviour.
+# RC3: on hybrid boxes KWin scans BOTH DRM cards for outputs; NVIDIA's
+#      non-drm-sync card can force software compositing.  Pin KWIN_DRM_DEVICES
+#      at the i915 card -- ONLY when an NVIDIA and an i915 card coexist, so
+#      Intel-only/VM boots keep the default (md Fix 4).  Wayland-only.
+wl_sess="$TREE/Programs/SDDM/$SDDM_VER/share/sddm/scripts/wayland-session"
+x_sess="$TREE/Programs/SDDM/$SDDM_VER/share/sddm/scripts/Xsession"
+_egl_block=$(cat <<'GOBOEGL'
+# --- gobo livefix: NVIDIA-EGL-Wayland-issues.md RC2 / SDDM-theme Fix D-3 (baked) ---
+# Only rescue a session that ALREADY restricts the EGL vendor list (append
+# Mesa so glvnd still has a provider for the Intel iGPU).  When nothing set
+# the list, leave it EMPTY: glvnd then scans the default directory and finds
+# BOTH Mesa (50_mesa.json) and NVIDIA, which is what a hybrid box needs.
+_nv=0
+for _c in /sys/class/drm/card*; do
+    [ -r "$_c/device/uevent" ] || continue
+    case "$(sed -n 's/^DRIVER=//p' "$_c/device/uevent" 2>/dev/null)" in
+        nvidia|nouveau) _nv=1 ;;
+    esac
+done
+if [ "$_nv" = 1 ] && [ -n "$__EGL_VENDOR_LIBRARY_FILENAMES" ]; then
+    case ":$__EGL_VENDOR_LIBRARY_FILENAMES:" in
+        *":/usr/share/glvnd/egl_vendor.d/50_mesa.json:"*) : ;;
+        *) export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES}:/usr/share/glvnd/egl_vendor.d/50_mesa.json" ;;
+    esac
+fi
+unset _nv _c
+GOBOEGL
+)
+_kwin_block=$(cat <<'GOBOKWIN'
+# --- gobo livefix: NVIDIA-EGL-Wayland-issues.md RC3 (baked) ---
+_nv_card=
+_i915_card=
+for _c in /sys/class/drm/card*; do
+    [ -r "$_c/device/uevent" ] || continue
+    case "$(sed -n 's/^DRIVER=//p' "$_c/device/uevent" 2>/dev/null)" in
+        nvidia|nouveau) _nv_card="$_c" ;;
+        i915) _i915_card="$_c" ;;
+    esac
+done
+if [ -n "$_nv_card" ] && [ -n "$_i915_card" ]; then
+    export KWIN_DRM_DEVICES="/dev/dri/$(basename "$_i915_card")"
+fi
+unset _nv_card _i915_card _c
+GOBOKWIN
+)
+for sess in "$wl_sess" "$x_sess"; do
+    [ -f "$sess" ] || continue
+    if grep -q 'gobo livefix: NVIDIA-EGL-Wayland-issues.md RC2' "$sess"; then
+        say "NVIDIA ${sess##*/}: RC2/RC3 session block already injected"
+        continue
+    fi
+    python3 - "$sess" "$_egl_block" "$_kwin_block" <<'GOBOPY'
+import sys
+p, egl, kwin = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(p, encoding="utf-8") as fh:
+    lines = fh.readlines()
+idx = None
+for i in range(len(lines) - 1, -1, -1):
+    if lines[i].lstrip().startswith("exec"):
+        idx = i
+        break
+if idx is None:
+    print("[livefix] %s: no exec line, skipping session injection" % p)
+    sys.exit(0)
+frag = [egl + "\n"]
+if p.endswith("wayland-session"):
+    frag.append(kwin + "\n")
+lines[idx:idx] = frag
+with open(p, "w", encoding="utf-8") as fh:
+    fh.writelines(lines)
+print("[livefix] session block injected in %s" % p)
+GOBOPY
+    say "NVIDIA ${sess##*/}: RC2 EGL-Mesa-fallback (+ RC3 KWIN pin on wayland-session) injected"
+done
 
 # --- 14c) Update desktop database -----------------------------------------------------------------
 if command -v update-desktop-database >/dev/null 2>&1; then
@@ -1178,24 +1842,67 @@ fi
 # own install already lands the correct .so.5 -> .so.5.15.2 link in /usr/lib.
 say "Qt5Wayland: skipped (Qt 5.15.2 provides its own wayland modules + platform plugins)"
 
-# --- 14e) Vulkan ICD registration + portal/libinput fixes ---------------------
-# The Vulkan loader scans /usr/share/vulkan/icd.d/ for driver JSONs (Nvidia
-# ships them under Resources/Unmanaged/usr).  EGL/glvnd vendor JSONs are owned
-# by block 19 (authoritative /usr/share materialization), NOT here: /usr/share
-# and glvnd are absolute symlinks that only resolve inside the ISO, so any
-# ln/cp through them fails ENOENT on the host.  Vulkan JSONs are symlinked in.
+# --- 14e) GPU driver manifests: Vulkan ICDs/layers + EGL external platforms ----
+# The Vulkan loader scans /usr/share/vulkan/{icd.d,implicit_layer.d,
+# explicit_layer.d} for driver JSONs; libglvnd scans
+# /usr/share/egl/egl_external_platform.d for the NVIDIA EGL stream platforms
+# (libnvidia-egl-wayland.so.1 / libnvidia-egl-wayland2.so.1, shipped by the
+# EGL-Wayland and EGL-Wayland2 programs).
+#
+# Everything is linked from the program that OWNS the manifest, into the
+# aggregation dirs under System/Index/share (that is where /usr/share resolves
+# to inside the ISO).  The base ISO ships some of those dirs as absolute
+# symlinks into a dead program dir (/Programs/Mesa/19.3.3/...), which on the
+# build host dangle -- so the dirs are first turned into REAL aggregation
+# dirs (gpu_real_dir, which also handles the case where a PARENT of the
+# manifest dir is the symlink), otherwise every ln -sf either writes through
+# the symlink into the dead program dir or fails with ENOENT.
+#
+# The loader needs ALL of the ICDs, not just NVIDIA's: the dGPU (NVIDIA), the
+# iGPU (Intel, from the Vulkan-Intel program) and Mesa for anything no vendor
+# covers.  The GLVND EGL vendor JSONs are handled by section 19.
+gpu_real_dir "$TREE/System/Index/share/vulkan/icd.d"
+gpu_real_dir "$TREE/System/Index/share/vulkan/implicit_layer.d"
+gpu_real_dir "$TREE/System/Index/share/vulkan/explicit_layer.d"
+gpu_real_dir "$TREE/System/Index/share/egl/egl_external_platform.d"
 
-icd_dir="$TREE/usr/share/vulkan/icd.d"             # -> /System/Index/share/vulkan/icd.d
-mkdir -p "$icd_dir"
-icd_count=0
-for json in nvidia_icd.json nvidia_icd.x86_64.json nvidia_icd.i686.json; do
-    f="$TREE"/Programs/Nvidia/*/Resources/Unmanaged/usr/share/vulkan/icd.d/$json
-    if [ -f "$f" ]; then
-        ln -sf "/${f#$TREE/}" "$icd_dir/$json"
-        icd_count=$((icd_count + 1))
-    fi
+# The EGL dispatcher itself: the index must not hand out NVIDIA's bundled
+# GLVND fork under libEGL.so.1 while libEGL.so points at the real GLVND.
+gpu_egl_dispatcher
+# Stale nvidia_* that older builds wrote THROUGH those symlinks into a Mesa
+# program dir: they belong to the Nvidia program, never to Mesa.  Drop them
+# so a later Mesa upgrade cannot resurrect a foreign driver manifest.
+for f in "$TREE"/Programs/Mesa/*/share/vulkan/*/nvidia_* \
+         "$TREE"/Programs/Mesa/*/share/glvnd/egl_vendor.d/nvidia_*; do
+    [ -e "$f" ] || continue
+    rm -f "$f"
+    say "GPU manifests: removed stale ${f#$TREE/}"
 done
-[ "$icd_count" -gt 0 ] && say "Vulkan ICDs linked ($icd_count)"
+
+# Vulkan ICDs: NVIDIA first, then the Intel driver, then Mesa.
+gpu_link_manifests vulkan/icd.d \
+    "$TREE"/Programs/Nvidia-Utils/*/Resources/Unmanaged/usr/share/vulkan/icd.d \
+    "$TREE"/Programs/Nvidia/*/Resources/Unmanaged/usr/share/vulkan/icd.d \
+    "$TREE"/Programs/Vulkan-Intel/*/Resources/Unmanaged/usr/share/vulkan/icd.d \
+    "$TREE"/Programs/Mesa/*/share/vulkan/icd.d
+
+# Vulkan layers (implicit + explicit).  The explicit_layer.d dir has to
+# EXIST even when no program ships a manifest: the loader scans it.
+gpu_link_manifests vulkan/implicit_layer.d \
+    "$TREE"/Programs/Nvidia-Utils/*/Resources/Unmanaged/usr/share/vulkan/implicit_layer.d \
+    "$TREE"/Programs/Nvidia/*/Resources/Unmanaged/usr/share/vulkan/implicit_layer.d \
+    "$TREE"/Programs/Mesa/*/share/vulkan/implicit_layer.d
+gpu_link_manifests vulkan/explicit_layer.d \
+    "$TREE"/Programs/Nvidia-Utils/*/Resources/Unmanaged/usr/share/vulkan/explicit_layer.d \
+    "$TREE"/Programs/Nvidia/*/Resources/Unmanaged/usr/share/vulkan/explicit_layer.d \
+    "$TREE"/Programs/Mesa/*/share/vulkan/explicit_layer.d
+
+# EGL external platforms (EGL-Wayland / EGL-Wayland2 + the driver's own).
+gpu_link_manifests egl/egl_external_platform.d \
+    "$TREE"/Programs/EGL-Wayland/*/share/egl/egl_external_platform.d \
+    "$TREE"/Programs/EGL-Wayland2/*/share/egl/egl_external_platform.d \
+    "$TREE"/Programs/Nvidia-Utils/*/Resources/Unmanaged/usr/share/egl/egl_external_platform.d \
+    "$TREE"/Programs/Nvidia/*/Resources/Unmanaged/usr/share/egl/egl_external_platform.d
 
 # xdg-desktop-portal-gtk: built as a libexec-only program; mother processes on
 # a Wayland session look up the backend in /System/Index/libexec.
@@ -1278,27 +1985,258 @@ fi
 # GParted / the Gobo GUI installer need root from the 'live' desktop session.
 # sudo already ships (Programs/Sudo); give live NOPASSWD and fix the canonical
 # sudoers mode/owner (Packages unpack as live:avahi 0644, which sudo dislikes).
-SUDOERS_FILE="$TREE/Programs/Sudo/Settings/sudoers"
-if [ -f "$SUDOERS_FILE" ]; then
-    if ! grep -q '^live[[:space:]]' "$SUDOERS_FILE"; then
-        printf '\n# LiveCD user: root for GParted / Gobo GUI installer (no password prompt)\nlive ALL=(ALL) NOPASSWD: ALL\n' >> "$SUDOERS_FILE"
-        say "sudoers: live ALL=(ALL) NOPASSWD: ALL"
+# --- live-sudo (15b) begin ----------------------------------------------------
+# Hardened: the old version edited ONLY $TREE/Programs/Sudo/Settings/sudoers and
+# did NOTHING, silently, when that path was missing -- so an ISO could ship with
+# no rule for live ("live is not in the sudoers file").  Now every sudoers file
+# sudo could read is found (symlinks resolved INSIDE the image tree), each one
+# gets the rule, and the end of this script verifies it and fails the build.
+LIVE_SUDO_RULE='live ALL=(ALL:ALL) NOPASSWD: ALL'
+LIVE_SUDO_FAIL=0
+SUDO_FILES=()
+
+# Resolve an absolute in-image path to the real file under $TREE, following
+# symlinks at EVERY component and treating absolute link targets as image-
+# relative.  A plain [ -f ] / readlink -f would resolve them against the build
+# chroot's own /Programs and /System and could edit the wrong sudoers.
+tree_realpath() { # </in/image/path> -> real path under $TREE
+    local T="${TREE%/}" rest="${1#/}" cur comp link n=0
+    cur="$T"
+    while [ -n "$rest" ]; do
+        comp="${rest%%/*}"
+        if [ "$comp" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+        case "$comp" in
+            ""|.) continue ;;
+            ..) cur="$(dirname "$cur")"
+                case "$cur" in "$T"|"$T"/*) ;; *) cur="$T" ;; esac
+                continue ;;
+        esac
+        cur="$cur/$comp"
+        if [ -L "$cur" ]; then
+            n=$((n + 1)); [ "$n" -le 40 ] || return 1
+            link="$(readlink "$cur")" || return 1
+            case "$link" in
+                /*) cur="$T"; rest="${link#/}${rest:+/$rest}" ;;
+                *)  cur="$(dirname "$cur")"; rest="$link${rest:+/$rest}" ;;
+            esac
+        fi
+    done
+    printf '%s' "$cur"
+}
+
+add_sudoers_file() { # </in/image/path>: remember its real file once
+    local real e
+    real="$(tree_realpath "$1")" || return 0
+    [ -f "$real" ] || return 0
+    for e in ${SUDO_FILES[@]+"${SUDO_FILES[@]}"}; do
+        [ "$e" = "$real" ] && return 0
+    done
+    SUDO_FILES+=("$real")
+}
+add_sudoers_file /etc/sudoers
+add_sudoers_file /System/Settings/sudoers
+add_sudoers_file /Programs/Sudo/Settings/sudoers
+
+for sf in ${SUDO_FILES[@]+"${SUDO_FILES[@]}"}; do
+    if grep -Eq '^[[:space:]]*live[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL[[:space:]]*$' "$sf"; then
+        say "sudoers: ok (already) ${sf#"${TREE%/}"/}"
+    elif printf '\n# LiveCD user: root for GParted / Gobo GUI installer (no password prompt)\n%s\n' \
+            "$LIVE_SUDO_RULE" >> "$sf"; then
+        say "sudoers: appended '$LIVE_SUDO_RULE' to ${sf#"${TREE%/}"/}"
+    else
+        say "ERROR: cannot write $sf"
+        LIVE_SUDO_FAIL=1
     fi
-    chown root:root "$SUDOERS_FILE" 2>/dev/null || true
-    chmod 440 "$SUDOERS_FILE" 2>/dev/null || true
+    chown root:root "$sf" 2>/dev/null || true
+    chmod 0440 "$sf" 2>/dev/null || true
+    # A syntax error makes sudo refuse the WHOLE file, so validate when a
+    # visudo exists in the build chroot.  Only a real syntax error fails the
+    # build; "could not run visudo" is just a warning.
+    if command -v visudo >/dev/null 2>&1; then
+        vout="$(visudo -c -f "$sf" 2>&1)"; vrc=$?
+        if [ "$vrc" -eq 0 ]; then
+            say "sudoers: visudo -c OK for ${sf#"${TREE%/}"/}"
+        elif printf '%s' "$vout" | grep -qiE 'syntax error|parse error'; then
+            say "ERROR: sudoers syntax error in ${sf#"${TREE%/}"/}:"
+            printf '%s\n' "$vout" | sed 's/^/[livefix]     /'
+            LIVE_SUDO_FAIL=1
+        else
+            say "WARNING: visudo could not validate ${sf#"${TREE%/}"/} (rc=$vrc): $(printf '%s' "$vout" | head -1)"
+        fi
+    fi
+done
+if [ "${#SUDO_FILES[@]}" -eq 0 ]; then
+    if [ -d "$TREE/Programs/Sudo" ]; then
+        say "ERROR: Programs/Sudo is in the image but no sudoers file was found"
+        say "       (tried /etc/sudoers, /System/Settings/sudoers, /Programs/Sudo/Settings/sudoers)"
+        LIVE_SUDO_FAIL=1
+    else
+        say "WARNING: no Programs/Sudo in this image - sudo for live is NOT configured"
+    fi
 fi
+
+# sudo still runs PAM account management + session for a NOPASSWD rule, so it
+# needs a PAM service.  Create one only when the Sudo package did not ship it
+# (never overwrite a file, or a symlink that is dangling on the host).
+if [ -d "$TREE/Programs/Sudo" ] && [ ! -e "$TREE/etc/pam.d/sudo" ] && [ ! -L "$TREE/etc/pam.d/sudo" ]; then
+    mkdir -p "$TREE/etc/pam.d"
+    cat > "$TREE/etc/pam.d/sudo" <<'PAMSUDO'
+#%PAM-1.0
+auth       include      system-auth
+account    include      system-account
+password   include      system-password
+session    include      system-session
+PAMSUDO
+    say "created etc/pam.d/sudo (the Sudo package shipped none)"
+fi
+# --- live-sudo (15b) end ------------------------------------------------------
 # pkexec-based launchers (GParted.desktop, Gobo installer) authenticate through
-# polkitd; authorize live for any admin action with no prompt.
+# polkitd; authorize live for the actions those flows need -- but ONLY those.
+# A blanket YES for every admin action silently swallowed the password prompt
+# that the SDDM KCM must show when installing/theming (org.kde.kcontrol.*),
+# making SDDM theme installs look like a no-op.  Scoped: pkexec itself,
+# udisks2/polkit for disk+partition tooling, packagekit/fwupd; also allow
+# SDDM theme installs via org.kde.kcontrol.* for the live user.
 mkdir -p "$TREE/etc/polkit-1/rules.d"
 if [ ! -f "$TREE/etc/polkit-1/rules.d/10-live.rules" ]; then
     cat > "$TREE/etc/polkit-1/rules.d/10-live.rules" <<'POLKIT'
 polkit.addRule(function(action, subject) {
+    // live user: no prompt ONLY for the live-desktop administration flows.
     if (subject.user == "live") {
-        return polkit.Result.YES;
+        if (/^(org\.freedesktop\.policykit\.exec|org\.freedesktop\.udisks2(\.|$)|org\.freedesktop\.packagekit(\.|$)|org\.freedesktop\.fwupd(\.|$)|org\.gobo(\.|$))/.test(action.id)) {
+            return polkit.Result.YES;
+        }
+        if (/^org\.kde\.kcontrol\./.test(action.id)) {
+            return polkit.Result.YES;
+        }
     }
 });
 POLKIT
-    say "polkit: live user may authorize any admin action (10-live.rules)"
+    say "polkit: scoped 10-live.rules (silent YES for live: pkexec/udisks2/pkgkit/fwupd/gobo + org.kde.kcontrol.*)"
+fi
+# Also set live as admin identity so prompts (if any) target live user
+if [ ! -f "$TREE/etc/polkit-1/rules.d/10-live-admin.rules" ]; then
+    cat > "$TREE/etc/polkit-1/rules.d/10-live-admin.rules" <<'POLKITADM'
+polkit.addAdminRule(function(action, subject) {
+    return ["unix-user:live"];
+});
+POLKITADM
+    say "polkit: 10-live-admin.rules sets live as admin identity"
+fi
+
+# --- 14f1) Fix glibc iconv/gconv path (libmtp needs UTF-16LE) ----------------
+# glibc's default is /usr/lib/x86_64-linux-gnu/gconv on some builds; ISO has
+# modules at /System/Index/lib/gconv. Provide the expected path.  /System/
+# Index/lib/gconv is a GoboLinux ABSOLUTE dirlink (host-dangling), so guard on
+# -L as well, else a host-side livefix silently skips the fix.
+if [ -d "$TREE/System/Index/lib/gconv" ] || [ -L "$TREE/System/Index/lib/gconv" ]; then
+    mkdir -p "$TREE/usr/lib/x86_64-linux-gnu"
+    ln -sfn /System/Index/lib/gconv "$TREE/usr/lib/x86_64-linux-gnu/gconv"
+fi
+
+# --- 14f) Lutris ESYNC open-file hard limit ----------------------------------
+# /etc/security/limits.conf ships with no active entries (comments only), so
+# pam_limits.so (loaded via sddm -> system-login -> system-session) leaves
+# RLIMIT_NOFILE at logind's 4096.  Lutris gates ESYNC on the HARD nofile limit
+# >= 524288 (lutris/util/linux.py) and aborts EVERY launch with
+# "Your ESYNC limits are not set correctly."  /etc/security/limits.conf is a
+# symlink into Linux-PAM's Settings tree, so append to the real in-tree target;
+# pam_limits picks it up on the next login (Lutris-ESYNC-limits-not-set-on-live-ISO.md).
+_limits_link="$TREE/etc/security/limits.conf"
+if [ -L "$_limits_link" ]; then
+    _limits_target="$TREE$(readlink "$_limits_link")"
+else
+    _limits_target="$_limits_link"
+fi
+if [ -f "$_limits_target" ] && \
+   ! grep -q '^[^#].*nofile' "$_limits_target" 2>/dev/null; then
+    cat >> "$_limits_target" <<'ESYNCLIMIT'
+
+# Lutris/Wine ESYNC needs RLIMIT_NOFILE >= 524288 (hard) to launch; applies via
+# pam_limits on the next login (live ISO fix, Lutris-ESYNC-limits-not-set-on-live-ISO.md).
+*      hard    nofile   524288
+*      soft    nofile   524288
+root   hard    nofile   524288
+root   soft    nofile   524288
+ESYNCLIMIT
+    say "PAM limits.conf: Lutris ESYNC nofile=524288 baked (hard+soft, root+*)"
+else
+    [ -f "$_limits_target" ] && \
+        say "PAM limits.conf already carries an active nofile entry; leaving untouched"
+fi
+# /etc/security/limits.d is ALSO a symlink (into LibPipewire's Settings dir).
+# Program packages may ship their own PAM drop-ins under
+# Resources/Unmanaged/etc/security/limits.d/ (Lutris ships 30-esync.conf for
+# the Wine ESYNC gate).  Materialize every shipped drop-in into the real
+# limits.d target so pam_limits reads them too (symlink style like 14e; a
+# pipeline of "/Programs/*/*/..." covers versioned dirs AND Current links).
+_limits_d_link="$TREE/etc/security/limits.d"
+if [ -L "$_limits_d_link" ]; then
+    _limits_d_target="$TREE$(readlink "$_limits_d_link")"
+else
+    _limits_d_target="$_limits_d_link"
+fi
+mkdir -p "$_limits_d_target"
+_ld_count=0
+for _f in "$TREE"/Programs/*/*/Resources/Unmanaged/etc/security/limits.d/*.conf \
+          "$TREE"/Programs/*/Current/Resources/Unmanaged/etc/security/limits.d/*.conf; do
+    [ -f "$_f" ] || continue
+    if { [ -e "$_limits_d_target/$(basename "$_f")" ] || [ -L "$_limits_d_target/$(basename "$_f")" ]; }; then
+        continue
+    fi
+    ln -s "/${_f#$TREE/}" "$_limits_d_target/$(basename "$_f")"
+    _ld_count=$((_ld_count + 1))
+done
+[ "$_ld_count" -gt 0 ] && say "PAM limits.d: $_ld_count program drop-in(s) linked"
+
+# --- 14g) Lutris runtime DXVK / VKD3D from the system packages ----------------
+# Offline live ISO: Lutris' DLL managers resolve their components under
+# ~/.local/share/lutris/runtime/<name>/<version>/<arch> and, with no network,
+# the "Preferences/Updates" downloader can't fetch them.  A D3D11/D3D12 game
+# then falls back to WineD3D and dies with "3D accelerator card is not
+# supported" even though the component is compiled into the image.
+# Pre-seed those caches from the system packages for live (and root):
+#   DXVK   Programs/DXVK/<ver>/lib/dxvk/{x32,x64}
+#   VKD3D  Programs/Vkd3d-Proton/<ver>/lib/vkd3d/{x86,x64}  (mapped to x32/x64)
+# Lutris' arch dirs are {32:"x32",64:"x64"} (dll_manager.py); the system Vkd3d
+# package ships x86/x64, so x86 is exposed as x32.  The dir name is the version
+# string Lutris keys on and is its default (DXVKManager().version).  Absolute
+# links so they resolve inside the ISO (like 14e).
+# See Lutris-Vulkan-not-detected-DXVK-unavailable-on-live-ISO.md and
+# Wine-WoW-3D-accelerator-card-not-supported-on-live-ISO.md.
+_dxvk_dir=$(readlink -f "$TREE/Programs/DXVK/Current" 2>/dev/null)
+[ -n "$_dxvk_dir" ] || _dxvk_dir=$(ls -d "$TREE"/Programs/DXVK/[0-9]* 2>/dev/null | sort -V | tail -1)
+_vkd3d_dir=$(readlink -f "$TREE/Programs/Vkd3d-Proton/Current" 2>/dev/null)
+[ -n "$_vkd3d_dir" ] || _vkd3d_dir=$(ls -d "$TREE"/Programs/Vkd3d-Proton/[0-9]* 2>/dev/null | sort -V | tail -1)
+if [ -n "$_dxvk_dir" ] && [ -d "$_dxvk_dir/lib/dxvk" ]; then
+    _dxvk_ver="v$(basename "$_dxvk_dir")"
+    _vkd3d_ver=""
+    if [ -n "$_vkd3d_dir" ] && [ -d "$_vkd3d_dir/lib/vkd3d" ]; then
+        _vkd3d_ver="v$(basename "$_vkd3d_dir")"
+    fi
+    _rt_seeded=0
+    for _home in "$TREE/Users/live" "$TREE/Users/root"; do
+        [ -d "$_home" ] || continue
+        _rt="$_home/.local/share/lutris/runtime"
+        mkdir -p "$_rt/dxvk/$_dxvk_ver"
+        for _a in x32 x64; do
+            [ -d "$_dxvk_dir/lib/dxvk/$_a" ] || continue
+            ln -sfn "/${_dxvk_dir#$TREE/}/lib/dxvk/$_a" "$_rt/dxvk/$_dxvk_ver/$_a"
+            _rt_seeded=1
+        done
+        if [ -n "$_vkd3d_ver" ]; then
+            mkdir -p "$_rt/vkd3d/$_vkd3d_ver"
+            for _pair in "x64:x64" "x32:x86"; do
+                _la=${_pair%%:*}; _sa=${_pair##*:}
+                [ -d "$_vkd3d_dir/lib/vkd3d/$_sa" ] || continue
+                ln -sfn "/${_vkd3d_dir#$TREE/}/lib/vkd3d/$_sa" "$_rt/vkd3d/$_vkd3d_ver/$_la"
+                _rt_seeded=1
+            done
+        fi
+    done
+    if [ "$_rt_seeded" -gt 0 ]; then
+        say "Lutris runtime seeded from system: DXVK $_dxvk_ver${_vkd3d_ver:+ + VKD3D $_vkd3d_ver} (live+root)"
+    fi
 fi
 
 # --- 15c) Setuid-root sweep: sudo/pkexec/polkitd/unix_chkpwd/dbus helper ------
@@ -1311,10 +2249,20 @@ fi
 # `chown -R <symlink>` nor plain `find <path>` follows it — those were silent
 # no-ops.  Every helper below resolves Current with readlink -f first and acts
 # on the real version dir.
-progdir() { # <ProgramName> -> real Current dir ('' if absent)
-    if [ -d "$TREE/Programs/$1" ]; then
-        readlink -f "$TREE/Programs/$1/Current" 2>/dev/null
-    fi
+progdir() { # <ProgramName> -> real Current dir INSIDE $TREE ('' if absent)
+    # Uses tree_realpath (defined in 15b): it follows symlinks only INSIDE the
+    # image, treating absolute link targets as image-relative, and keeps the
+    # $TREE prefix exactly as the rest of this script spells it.
+    # DO NOT go back to "readlink -f $TREE/...": it canonicalises the $TREE
+    # prefix itself, so if any component of $TREE is a symlink (e.g. /mnt in the
+    # Gobo chroot) the result no longer starts with "$TREE" and a prefix test
+    # fails -> '' -> every setuid/ownership fix that uses progdir (sudo, pkexec,
+    # unix_chkpwd, dbus helper) is silently skipped.
+    local d
+    [ -d "$TREE/Programs/$1" ] || return 0
+    d="$(tree_realpath "/Programs/$1/Current")" || return 0
+    [ -d "$d" ] && printf '%s' "$d"
+    return 0
 }
 
 # sudo itself + its policy plug-ins must be root-owned; sudo binary setuid.
@@ -1348,14 +2296,22 @@ fi
 # <libdir>/dbus/dbus-daemon-launch-helper; refresh-index only publishes
 # lib/dbus-1/, so mirror the missing Index/lib/dbus/ entry as an absolute
 # symlink (exec through it honors the target's setuid bit).
+# NOTE: the system bus daemon runs as the dedicated user "messagebus"; the
+# helper must therefore be EXECUTABLE by that user (group = messagebus, 4750).
+# root:root 4750/4755 makes dbus report "Failed to execute program <name>:
+# Permission denied" for every User=root activation (all KAuth helpers, colord,
+# upower) -- the D-Bus half of the SDDM theme-install failures.
 DBUS_DIR="$(progdir DBus)"
 if [ -n "$DBUS_DIR" ] && [ -e "$DBUS_DIR/lib/dbus-daemon-launch-helper" ]; then
-    chown root:root "$DBUS_DIR/lib/dbus-daemon-launch-helper" 2>/dev/null || true
-    chmod 4755 "$DBUS_DIR/lib/dbus-daemon-launch-helper" 2>/dev/null || true
+    mb_gid=$(awk -F: '$1=="messagebus"{print $3; exit}' "$TREE/etc/group" 2>/dev/null)
+    [ -n "$mb_gid" ] || mb_gid=0
+    chown root:"$mb_gid" "$DBUS_DIR/lib/dbus-daemon-launch-helper" 2>/dev/null || true
+    chmod 4750 "$DBUS_DIR/lib/dbus-daemon-launch-helper" 2>/dev/null || true
     mkdir -p "$TREE/System/Index/lib/dbus"
-    if [ ! -e "$TREE/System/Index/lib/dbus/dbus-daemon-launch-helper" ]; then
+    if [ ! -e "$TREE/System/Index/lib/dbus/dbus-daemon-launch-helper" ] && \
+       [ ! -L "$TREE/System/Index/lib/dbus/dbus-daemon-launch-helper" ]; then
         ln -s /System/Index/lib/dbus-daemon-launch-helper "$TREE/System/Index/lib/dbus/dbus-daemon-launch-helper" 2>/dev/null && \
-            say "dbus: indexed lib/dbus/dbus-daemon-launch-helper (setuid)"
+            say "dbus: indexed lib/dbus/dbus-daemon-launch-helper (setuid, group messagebus)"
     fi
 fi
 # polkitd drops privileges to a dedicated system user; the Gobo base ships a
@@ -1422,6 +2378,32 @@ else
     say "WARNING: PantheonPolkitAgent not found — no polkit prompt agent"
 fi
 
+# --- 17b) KDE/Plasma polkit agent autostart -----------------------------------
+# On a Plasma ISO the auth agent is Polkit-KDE-Agent-1. It ships its autostart
+# .desktop ONLY in the program tree (etc/xdg/autostart/polkit-kde-authentication
+# -agent-1.desktop); the session scans the global dir (/etc/xdg/autostart, an
+# alias of /System/Settings/xdg/autostart), which has no entry -- so without
+# this link no PolicyKit prompt ever appears from the Plasma session
+# (systemsettings' SDDM page included). Link it in like the Plasma-Workspace
+# autostart entries below, +x included (KDE autostart policy skips system-wide
+# entries that are neither root-owned nor executable; packages extract as
+# live:avahi).
+pkd_src=$(ls "$TREE"/Programs/Polkit-KDE-Agent-1/*/etc/xdg/autostart/polkit-kde-authentication-agent-1.desktop 2>/dev/null | head -1)
+if [ -n "$pkd_src" ]; then
+    pkd_link="$TREE/System/Settings/xdg/autostart/polkit-kde-authentication-agent-1.desktop"
+    mkdir -p "$(dirname "$pkd_link")"
+    ln -sf "/${pkd_src#$TREE/}" "$pkd_link"
+    # Force software rendering for agent (Wayland/NVIDIA EGL can crash Qt QML)
+    if ! grep -q "QSG_RHI_BACKEND=software" "$pkd_src" 2>/dev/null; then
+        sed -i 's|^Exec=|Exec=env QSG_RHI_BACKEND=software QT_QUICK_BACKEND=software LIBGL_ALWAYS_SOFTWARE=1 |' "$pkd_src"
+        say "polkit-kde-agent: forced software RHI backend in autostart"
+    fi
+    chmod +x "$pkd_src" 2>/dev/null
+    say "linked Polkit-KDE-Agent-1 polkit auth agent into /etc/xdg/autostart"
+else
+    say "WARNING: Polkit-KDE-Agent-1 not found — no polkit prompt agent for Plasma"
+fi
+
 # --- 18) Ensure the Wayland session file targets the Wayland compositor --------
 # pantheon-wayland.session requires the 'gala-wayland' component (gala run as a
 # native Wayland compositor).  The bare 'pantheon.session' requires 'gala' and
@@ -1472,11 +2454,15 @@ else
 JSON
     say "EGL vendor: wrote known-good 50_mesa.json (no Mesa share present in tree)"
 fi
-NV_VENDOR_DIR="$TREE/Programs/Nvidia/Current/Resources/Unmanaged/usr/share/glvnd/egl_vendor.d"
-if [ -d "$NV_VENDOR_DIR" ] && ls "$TREE"/Programs/Nvidia/Current/lib/libEGL_nvidia.so.* >/dev/null 2>&1; then
-    for j in "$NV_VENDOR_DIR"/10_nvidia.json "$NV_VENDOR_DIR"/10_nvidia_wayland.json \
-             "$NV_VENDOR_DIR"/15_nvidia_gbm.json "$NV_VENDOR_DIR"/20_nvidia_xcb.json \
-             "$NV_VENDOR_DIR"/20_nvidia_xlib.json; do
+NV_VENDOR_DIR="$TREE/Programs/Nvidia-Utils/Current/Resources/Unmanaged/usr/share/glvnd/egl_vendor.d"
+[ -d "$NV_VENDOR_DIR" ] || NV_VENDOR_DIR="$TREE/Programs/Nvidia/Current/Resources/Unmanaged/usr/share/glvnd/egl_vendor.d"
+if [ -d "$NV_VENDOR_DIR" ] && ls "$TREE"/Programs/Nvidia-Utils/Current/lib/libEGL_nvidia.so.* "$TREE"/Programs/Nvidia/Current/lib/libEGL_nvidia.so.* >/dev/null 2>&1; then
+    # Data-driven on purpose: the driver ships 09_nvidia_wayland2.json (the
+    # EGL-Wayland2 external platform) next to the five older ones, and a
+    # hardcoded list silently dropped it -- glvnd then had no wayland2
+    # provider.  Take EVERY json the driver ships, so a future driver
+    # release cannot be half-linked again.
+    for j in "$NV_VENDOR_DIR"/*.json; do
         [ -f "$j" ] || continue
         rm -f "$VENDOR_DIR/$(basename "$j")"
         ln -sf "/${j#$TREE/}" "$VENDOR_DIR/$(basename "$j")"
@@ -1513,7 +2499,20 @@ for broot in "$TREE"/Programs/*/*/qml "$TREE"/Programs/*/*/lib/qml; do
         case "$mod" in */*) ;; *) continue ;; esac    # skip top-level QtQuick/...
         tgt="$QML_INDEX/$mod"
         src="/${qmldirf#$TREE/}"; src="${src%/qmldir}"
-        mkdir -p "$(dirname "$tgt")"
+        # Skip a module whose PARENT namespace is already a symlink.  GoboLinux
+        # index links point at ABSOLUTE /Programs/... paths, so on the host tree
+        # the parent dangles: mkdir -p through it fails ("File exists") and the
+        # inner ln fails ("No such file or directory").  The parent link already
+        # exposes the whole subtree at runtime (kirigami/platform, ...), so the
+        # inner module needs no separate entry.
+        _anc="$QML_INDEX"; _skip=0
+        IFS='/' read -ra _parts <<<"${mod%/*}"
+        for _c in "${_parts[@]}"; do
+            _anc="$_anc/$_c"
+            [ -L "$_anc" ] && { _skip=1; break; }
+        done
+        [ "$_skip" = 1 ] && continue
+        mkdir -p "$(dirname "$tgt")" 2>/dev/null || true
         if [ -L "$tgt" ]; then
             rm -f "$tgt"
         elif [ -d "$tgt" ]; then
@@ -1538,10 +2537,10 @@ done
 # load through kcm qrc files that `import QtCore`).  Mirror any missing
 # top-level Qt6 module from QtDeclarative as a last resort.
 for m in QtCore QtQml QtQuick QtNetwork QtTest; do
-    [ -e "$QML_INDEX/$m/qmldir" ] && continue
+    { [ -e "$QML_INDEX/$m/qmldir" ] || [ -L "$QML_INDEX/$m" ]; } && continue
     for src in "$TREE"/Programs/QtDeclarative/*/qml/$m; do
         [ -d "$src" ] && [ -e "$src/qmldir" ] || continue
-        ln -s "/${src#$TREE/}" "$QML_INDEX/$m"
+        ln -sfn "/${src#$TREE/}" "$QML_INDEX/$m"
         say "qml Index: linked top-level $m (missing KCM Qt6 module)"
         break
     done
@@ -1553,7 +2552,7 @@ done
 # etc.), so create it first or the bridge below silently never happens.
 QT6_QML="$TREE/Programs/QtBase/6.10.3/qml"
 mkdir -p "$QT6_QML"
-if [ ! -e "$QT6_QML/org" ]; then
+if [ ! -e "$QT6_QML/org" ] && [ ! -L "$QT6_QML/org" ]; then
     ln -s /System/Index/lib/qml/org "$QT6_QML/org"
     say "Qt6 qml: bridged ${QT6_QML#$TREE/}/org -> /System/Index/lib/qml/org"
 fi
@@ -1889,6 +2888,17 @@ for qp in "$TREE"/Programs/Qt*/; do
             elif [ -e "$link" ]; then
                 continue            # real dir/file the ISO already carries
             fi
+            # Parent namespace may be an absolute in-ISO symlink (e.g.
+            # wayland-shell-integration): its subtree is already exposed at
+            # runtime and cannot be written through on the host.  Skip quietly.
+            _anc="$QT_PLUG_MIRROR"; _skip=0
+            IFS='/' read -ra _parts <<<"$(dirname "$rel")"
+            for _c in "${_parts[@]}"; do
+                [ "$_c" = "." ] && continue
+                _anc="$_anc/$_c"
+                [ -L "$_anc" ] && { _skip=1; break; }
+            done
+            [ "$_skip" = 1 ] && continue
             mkdir -p "$(dirname "$link")"
             ln -s "/${qv#$TREE/}plugins/$rel" "$link" && MIRRORED=$((MIRRORED + 1))
         done < <(cd "$qv/plugins" && find . -mindepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
@@ -1923,8 +2933,8 @@ done
 # keys resolve to the same directory, restoring password root login.
 if [ -d "$TREE/Programs/OpenSSH/Settings/ssh" ]; then
     mkdir -p "$TREE/System/Settings/etc"
-    if [ ! -e "$TREE/System/Settings/etc/ssh" ]; then
-        ln -s /Programs/OpenSSH/Settings/ssh "$TREE/System/Settings/etc/ssh"
+    if [ ! -e "$TREE/System/Settings/etc/ssh" ] && [ ! -L "$TREE/System/Settings/etc/ssh" ]; then
+        ln -sfn /Programs/OpenSSH/Settings/ssh "$TREE/System/Settings/etc/ssh"
         say "linked /etc/ssh -> /Programs/OpenSSH/Settings/ssh (fatal sshd fix)"
     fi
     grep -qx 'PermitRootLogin yes' "$TREE/Programs/OpenSSH/Settings/ssh/sshd_config" \
@@ -2010,6 +3020,10 @@ GUARD_EOF
         /^source StartFunctions$/ { print; while ((getline line < g) > 0) print line; close(g); next }
         { print }
     ' "$CFG_BIN" > "$CFG_BIN.patched" && mv -f "$CFG_BIN.patched" "$CFG_BIN"
+    # The awk output is a NEW file, so it gets the umask's mode (0644) and
+    # the exec bit is LOST -> "/sbin/ConfigureLiveCD: Permission denied" at
+    # boot.  Put it back.
+    chmod 755 "$CFG_BIN"
     rm -f "$LIVE_GUARD"
     say "ConfigureLiveCD: guard inserted after 'source StartFunctions'"
 fi
@@ -2037,8 +3051,10 @@ for tl in Gio-2.0 GLib-2.0 GObject-2.0 GModule-2.0; do
         cp -p "$BASE_GIDIR/$tl.typelib" "$GIACT_DIR/$tl.typelib"
         say "restored $tl.typelib into GObject-Introspection/$GIACT/lib/girepository-1.0"
     fi
-    if [ -f "$GIACT_DIR/$tl.typelib" ] && [ ! -e "$TREE/usr/lib/girepository-1.0/$tl.typelib" ]; then
-        ln -s "/Programs/GObject-Introspection/$GIACT/lib/girepository-1.0/$tl.typelib" \
+    if [ -f "$GIACT_DIR/$tl.typelib" ] \
+       && [ ! -e "$TREE/usr/lib/girepository-1.0/$tl.typelib" ] \
+       && [ ! -L "$TREE/usr/lib/girepository-1.0/$tl.typelib" ]; then
+        ln -sfn "/Programs/GObject-Introspection/$GIACT/lib/girepository-1.0/$tl.typelib" \
             "$TREE/usr/lib/girepository-1.0/$tl.typelib"
         say "linked $tl.typelib"
     fi
@@ -2615,7 +3631,12 @@ EOF
     #           on "no NM on D-Bus" and report OFFLINE, which the update
     #           checker treats as "can't update / not connected to the
     #           Internet" even when the wire genuinely carries traffic.
-    nm_init="$TREE/System/Settings/BootScripts/NetworkManager/Init"
+    # NOTE: /System/Settings is a plain dir in the tree but its BootScripts
+    # subdir is an ABSOLUTE symlink -> /Programs/BootScripts/Settings/BootScripts
+    # (a path that only exists on a booted ISO). Writing through it on the host
+    # work tree ENOENTs, so bake at the canonical location instead; the live
+    # system resolves the symlink and finds the Init there.
+    nm_init="$TREE/Programs/BootScripts/Settings/BootScripts/NetworkManager/Init"
     if [ ! -f "$nm_init" ]; then
         mkdir -p "$(dirname "$nm_init")"
         cat > "$nm_init" <<'NMIO'
@@ -2624,16 +3645,43 @@ EOF
 # NM is intentionally run WITHOUT any interface (GoboNet/dhcpcd own the lease);
 # its job here is only to answer the org.freedesktop.NetworkManager D-Bus name
 # so Qt's QNetworkConfigurationManager reports connectivity accurately.
+# NetworkManager 1.51.4 rejects --no-dns-update (unknown option -> instant
+# exit, which silently defeated this boot daemon on every ISO), and it must be
+# able to own org.freedesktop.NetworkManager on the system bus -- that name is
+# granted by the policy copied into /System/Settings/dbus-1/system.d in §41c.
 NM_BIN="$(command -v NetworkManager 2>/dev/null || echo /Programs/NetworkManager/Current/sbin/NetworkManager)"
 pgrep -x NetworkManager >/dev/null 2>&1 && exit 0
 LOG=/Data/Variable/log
 mkdir -p "$LOG"
-exec setsid "$NM_BIN" --no-daemon --no-dns-update </dev/null >>"$LOG/NetworkManager.log" 2>&1 &
+exec setsid "$NM_BIN" --no-daemon </dev/null >>"$LOG/NetworkManager.log" 2>&1 &
 NMIO
         chmod 755 "$nm_init"
-        say "NetworkManager: baked /System/Settings/BootScripts/NetworkManager/Init (NM on D-Bus at boot -> Qt sees online)"
+        say "NetworkManager: baked /System/Settings/BootScripts/NetworkManager/Init -> Programs/BootScripts/Settings/BootScripts/NetworkManager/Init (NM on D-Bus at boot -> Qt sees online)"
     else
         say "NetworkManager: boot Init already present"
+    fi
+
+    # --- 41c) NM's system-bus policy must live where THIS dbus-daemon reads it.
+    # GoboLinux's /etc/dbus-1/system.conf includes only the Gobo path
+    # <includedir>/System/Settings/dbus-1/system.d</includedir>, but the
+    # NetworkManager package installs its policy to the FHS
+    # /usr/share/dbus-1/system.d -- a dir the system bus never reads here.
+    # Result: NM hits "AccessDenied: not allowed to own org.freedesktop.
+    # NetworkManager", exits, and Qt no-NM probes report OFFLINE forever
+    # (this defeated boot Init §41b on every ISO). Copy the policies over.
+    # /usr/share/dbus-1/system.d is empty in the work tree (only materialized
+    # on the booted ISO's merged index), so source the policies from the
+    # NetworkManager package share dir, with FHS as fallback.
+    nm_pol_fhs="$TREE/Programs/NetworkManager/Current/share/dbus-1/system.d"
+    nm_pol_gbo="$TREE/System/Settings/dbus-1/system.d"
+    if [ -d "$nm_pol_fhs" ] && [ ! -f "$nm_pol_gbo/org.freedesktop.NetworkManager.conf" ]; then
+        mkdir -p "$nm_pol_gbo"
+        for p in org.freedesktop.NetworkManager.conf nm-dispatcher.conf nm-priv-helper.conf; do
+            [ -f "$nm_pol_fhs/$p" ] && cp -a "$nm_pol_fhs/$p" "$nm_pol_gbo/$p"
+        done
+        say "dbus: copied NM policies to /System/Settings/dbus-1/system.d (NM can now own its D-Bus name)"
+    else
+        say "dbus: NM system.d policies already in place (or FHS source missing)"
     fi
 
     bootup="$TREE/Programs/BootScripts/Settings/BootScripts/BootUp"
@@ -2748,7 +3796,7 @@ say "== section 42: NVIDIA EGL-wayland unify + force-nvidia + wine boot shim =="
 # hex-versioned `.1.1.9`/`.1.1.20` names are just what the dlopened soname
 # finally dereferences to.
 EWLIB_DIR="$TREE/System/Index/lib"
-NV_REAL=$(find "$TREE"/Programs/Nvidia -name 'libnvidia-egl-wayland.so.1.1.2[0-9]' 2>/dev/null | sort -V | tail -1)
+NV_REAL=$(find "$TREE"/Programs/Nvidia-Utils "$TREE"/Programs/Nvidia -name 'libnvidia-egl-wayland.so.1.1.2[0-9]' 2>/dev/null | sort -V | tail -1)
 EW_REAL="$TREE/Programs/EGL-Wayland/1.1.9/lib/libnvidia-egl-wayland.so.1.1.9"
 WINNER=
 for cand in "$NV_REAL" "$EW_REAL"; do
@@ -2764,7 +3812,7 @@ if [ -n "$WINNER" ]; then
     ln -sfn "$winner_rel" "$EWLIB_DIR/libnvidia-egl-wayland.so"
     ln -sfn "$winner_rel" "$EWLIB_DIR/libnvidia-egl-wayland.so.1"
     case "$WINNER" in
-        "$TREE"/Programs/Nvidia/*) rm -f "$EWLIB_DIR/libnvidia-egl-wayland.so.1.1.9" ;;
+        "$TREE"/Programs/Nvidia/*|"$TREE"/Programs/Nvidia-Utils/*) rm -f "$EWLIB_DIR/libnvidia-egl-wayland.so.1.1.9" ;;
         *)                         rm -f "$EWLIB_DIR/libnvidia-egl-wayland.so.1.1.20" ;;
     esac
     say "EGL-wayland: unified to $(basename "$WINNER")"
@@ -2774,12 +3822,14 @@ fi
 
 # --- 42b) Verify /usr/share/egl/egl_external_platform.d is reachable ---------
 # libEGL scans $datadir/egl/egl_external_platform.d/*.json for
-# EGL_EXT_platform_wayland.  The recipe installs the JSON under the EGL-Wayland
-# Program tree; /usr/share/egl is a SYMLINK chain (usr/share -> System/Index/
-# share, and System/Index/share/egl -> Programs/EGL-Wayland/.../share/egl), so
-# it IS reachable at runtime as long as the links exist.  Host-side `ls`
-# misreports it because the targets are ISO-absolute; only fix it when the
-# chain is genuinely broken (like section 19 replaces stale glvnd links).
+# EGL_EXT_platform_wayland.  The recipes install the JSONs under their own
+# Program trees (EGL-Wayland -> 10_nvidia_wayland.json, EGL-Wayland2 ->
+# 09_nvidia_wayland2.json); /usr/share/egl is a SYMLINK chain (usr/share ->
+# System/Index/share, and System/Index/share/egl -> Programs/EGL-Wayland/.../
+# share/egl), so it IS reachable at runtime as long as the links exist.
+# Host-side `ls` misreports it because the targets are ISO-absolute; only fix
+# it when the chain is genuinely broken (like section 19 replaces stale glvnd
+# links).
 EXTDIR="$TREE/System/Index/share/egl/egl_external_platform.d"
 ext_ok=0
 if [ -L "$TREE/System/Index/share/egl" ]; then
@@ -2793,24 +3843,26 @@ if [ "$ext_ok" = 0 ]; then
         [ -L "$stale" ] && rm -f "$stale" && say "EGL external platform: dropped stale ${stale#$TREE/} symlink"
     done
     mkdir -p "$EXTDIR"
-    src=""
-    for j in "$TREE"/Programs/EGL-Wayland/*/share/egl/egl_external_platform.d/10_nvidia_wayland.json; do
-        [ -f "$j" ] && src="$j"
-    done
-    if [ -n "$src" ]; then
-        [ -e "$EXTDIR/10_nvidia_wayland.json" ] || ln -sf "/${src#$TREE/}" "$EXTDIR/10_nvidia_wayland.json"
-        say "EGL external platform: materialized 10_nvidia_wayland.json"
-    else
-        cat > "$EXTDIR/10_nvidia_wayland.json" <<'JSON'
-{
-    "file_format_version" : "1.0.0",
-    "ICD" : {
-        "library_path" : "libnvidia-egl-wayland.so.1"
+    # Materialize both NVIDIA EGL external platform JSONs (egl-wayland +
+    # egl-wayland2). Each is only linked when its recipe actually installed one;
+    # missing egl-wayland2 is fine (older trees / the driver-bundled copy).
+    _ext_link_or_write() {
+        local json="$1" prog="$2" lib="$3" src=""
+        for j in "$TREE"/Programs/"$prog"/*/share/egl/egl_external_platform.d/"$json"; do
+            [ -f "$j" ] && src="$j"
+        done
+        if [ -n "$src" ]; then
+            [ -e "$EXTDIR/$json" ] || ln -sf "/${src#$TREE/}" "$EXTDIR/$json"
+            say "EGL external platform: materialized $json (from $prog)"
+        else
+            [ -e "$EXTDIR/$json" ] && return 0
+            printf '{\n    "file_format_version" : "1.0.0",\n    "ICD" : {\n        "library_path" : "%s"\n    }\n}\n' \
+                "$lib" > "$EXTDIR/$json"
+            say "EGL external platform: wrote fallback $json"
+        fi
     }
-}
-JSON
-        say "EGL external platform: wrote fallback 10_nvidia_wayland.json"
-    fi
+    _ext_link_or_write 10_nvidia_wayland.json  EGL-Wayland  libnvidia-egl-wayland.so.1
+    _ext_link_or_write 09_nvidia_wayland2.json EGL-Wayland2 libnvidia-egl-wayland2.so.1
 else
     say "EGL external platform: symlink chain OK at runtime (no fix needed)"
 fi
@@ -2828,7 +3880,8 @@ fi
 # __GLX_VENDOR_LIBRARY_NAME=nvidia.  Under QEMU the driver is virtio-pci ->
 # vars stay unset -> Mesa/llvmpipe fallback is untouched.  This CANNOT be
 # decided at build time because the ISO always ships the nvidia program.
-NV_VENDOR_DIR="$TREE/Programs/Nvidia/Current/Resources/Unmanaged/usr/share/glvnd/egl_vendor.d"
+NV_VENDOR_DIR="$TREE/Programs/Nvidia-Utils/Current/Resources/Unmanaged/usr/share/glvnd/egl_vendor.d"
+[ -d "$NV_VENDOR_DIR" ] || NV_VENDOR_DIR="$TREE/Programs/Nvidia/Current/Resources/Unmanaged/usr/share/glvnd/egl_vendor.d"
 NV_FILES=""
 if [ -d "$NV_VENDOR_DIR" ]; then
     for j in "$NV_VENDOR_DIR"/10_nvidia.json "$NV_VENDOR_DIR"/10_nvidia_wayland.json \
@@ -2852,18 +3905,25 @@ for i, l in enumerate(s):
     if l.lstrip().startswith('exec'):
         if files:
             frag = [
-                '# --- force-nvidia-glvnd: nvidia EGL/GLX ONLY on a real NVIDIA GPU ---\n',
+                '# --- force-nvidia-glvnd: nvidia EGL/GLX ONLY when NVIDIA is the ONLY GPU ---\n',
+                '# On a hybrid (Intel i915/xe + NVIDIA) box KWin renders on the Intel card;\n',
+                '# forcing the nvidia GLVND vendors for the whole session would hide Mesa\n',
+                '# and starve the iGPU.  Leave the vendor list unset there so glvnd scans\n',
+                '# its default dir (10_nvidia*.json + 50_mesa.json) and PRIME offload works.\n',
                 'if [ -z "$__EGL_VENDOR_LIBRARY_FILENAMES" ]; then\n',
+                '    _fnv=0 _fi915=0\n',
                 '    for ue in /sys/class/drm/card*/device/uevent; do\n',
                 '        [ -r "$ue" ] || continue\n',
                 '        case "$(sed -n \'s/^DRIVER=//p\' "$ue" | head -1)" in\n',
-                '            nvidia|nouveau)\n',
-                '                export __EGL_VENDOR_LIBRARY_FILENAMES="%s"\n' % files,
-                '                export __GLX_VENDOR_LIBRARY_NAME=nvidia\n',
-                '                break\n',
-                '                ;;\n',
+                '            nvidia|nouveau) _fnv=1 ;;\n',
+                '            i915|xe) _fi915=1 ;;\n',
                 '        esac\n',
                 '    done\n',
+                '    if [ "$_fnv" = 1 ] && [ "$_fi915" = 0 ]; then\n',
+                '        export __EGL_VENDOR_LIBRARY_FILENAMES="%s"\n' % files,
+                '        export __GLX_VENDOR_LIBRARY_NAME=nvidia\n',
+                '    fi\n',
+                '    unset _fnv _fi915\n',
                 'fi\n',
             ]
             s[i:i] = frag
@@ -3086,29 +4146,34 @@ NVC
 else
     say "NvidiaCtl task already baked (ok)"
 fi
+# 14b3 (device-node wiring) runs BEFORE this section; on a fresh tree the task
+# file does not exist yet, so 14b3's boot wiring was skipped.  Wire it here too
+# (idempotent -- no-ops when 14b3 already linked/inserted) so RC1's boot
+# wiring always lands on the ISO even though the binary only exists after 42g:
+if { [ -e "$TREE/System/Tasks/NvidiaCtl" ] || [ -L "$TREE/System/Tasks/NvidiaCtl" ]; }; then
+    :
+else
+    mkdir -p "$TREE/System/Tasks"
+    ln -s "/Programs/Nvidia/Current/Resources/Tasks/NvidiaCtl" "$TREE/System/Tasks/NvidiaCtl"
+    say "NvidiaCtl task linked into /System/Tasks"
+fi
+if [ -f "$bootup" ] && ! grep -q 'StartTask NvidiaCtl' "$bootup"; then
+    sed -i '/^Exec .*SeatD Start/a Exec "Creating NVIDIA device nodes..."      StartTask NvidiaCtl' "$bootup"
+    say "BootUp: NvidiaCtl StartTask added right after SeatD Start"
+fi
+if [ -f "$sld" ] && ! grep -q 'StartTask NvidiaCtl' "$sld"; then
+    sed -i '/^StartTask SeatD/a\msg "Creating NVIDIA device nodes"\nStartTask NvidiaCtl' "$sld"
+    say "StartLiveCD: NvidiaCtl StartTask added right after SeatD Start"
+fi
 
-# --- 42h) Link the NVIDIA Vulkan ICD + implicit-layer JSONs into the merged ----
-# /usr/share/vulkan/icd.d + implicit_layer.d (same idiom as the in-tree ICD
-# wiring at 1156-1170, but for the Resources/Unmanaged twin that actually ships
-# on current NVIDIA builds + the explicit-layer JSON).  The runtime consumer
-# (Mesa/Nvidia loader, vulkaninfo) only looks in System/Index/share/vulkan,
-# and the driver's own Programs tree left these unlinked -- so "vulkaninfo"
-# listed Intel-only until we hand link nvidia_icd.json.  Idempotent.
-VUID="$TREE/System/Index/share/vulkan"
-NVUNM="$TREE/Programs/Nvidia/Current/Resources/Unmanaged/usr/share/vulkan"
-for sub in icd.d implicit_layer.d; do
-    mkdir -p "$VUID/$sub"
-    for json in nvidia_icd.json nvidia_icd.x86_64.json nvidia_icd.i686.json nvidia_layers.json; do
-        [ -f "$json" ] || continue
-        b="$(basename "$json")"
-        if [ -e "$VUID/$sub/$b" ]; then
-            say "  vulkan $sub: $b already present (ok)"
-        else
-            ln -sf "/${json#$TREE}" "$VUID/$sub/$b"
-            say "  vulkan $sub: linked $b (${json#$TREE/})"
-        fi
-    done
-done
+# --- 42h) NVIDIA Vulkan ICD + layer JSONs: DONE in 14e ------------------------
+# This used to link a hardcoded list (nvidia_icd.json, nvidia_icd.x86_64.json,
+# nvidia_icd.i686.json, nvidia_layers.json) into System/Index/share/vulkan,
+# which silently missed nvidia_icd_vksc.json and the whole explicit_layer.d
+# dir.  Section 14e now does this for every manifest the owning program
+# ships, and it also turns the base ISO's symlinked manifest dirs into real
+# aggregation dirs -- so there is ONE place that owns GPU driver manifests.
+# Kept as a marker so the section numbering does not shift.
 
 # --- 43) Phone / MTP automount: /Mount/phone via simple-mtpfs -----------------
 # GoboLinux's main user-mount dir is /Mount (mnt -> Mount; media -> Mount/Media),
@@ -3214,7 +4279,7 @@ start() {
     if [ "$muser" = "root" ]; then
         setsid -f "$SM" "$MP" </dev/null >>"$LOG/mtp-phone.log" 2>&1 || true
     else
-        setsid -f su - "$muser" -c "$SM '$MP'" </dev/null >>"$LOG/mtp-phone.log" 2>&1 || true
+        setsid -f runuser -u "$muser" -- env GCONV_PATH=/System/Index/lib/gconv "$SM" -o allow_other,uid=1000,gid=1000 "$MP" </dev/null >>"$LOG/mtp-phone.log" 2>&1 || true
     fi
     for i in $(seq 1 10); do
         mountpoint -q "$MP" 2>/dev/null && break
@@ -3278,14 +4343,174 @@ MTPRULE="$TREE/etc/udev/rules.d/70-mtp-phone.rules"
 if [ ! -f "$MTPRULE" ]; then
     mkdir -p "$(dirname "$MTPRULE")"
     cat > "$MTPRULE" <<'MTPR'
-# Android phone / PTP camera automount -> /Mount/phone (livefix 43e).
+# Android phone / PTP camera automount -> /Mount/phone (livefix 43e)
+# Match MTP/PTP by class 08/06 or 06/01 (still image/camera) AND also by
+# vendor-specific interface class 0xff (some phones report MTP on ff/ff).
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceClass}=="08", ATTR{bInterfaceSubClass}=="06", ACTION=="add",    RUN+="/System/Tasks/MtpPhone", ENV{MTP}="1"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceClass}=="06", ATTR{bInterfaceSubClass}=="01", ACTION=="add",    RUN+="/System/Tasks/MtpPhone", ENV{MTP}="1"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceClass}=="ff", ATTR{bInterfaceSubClass}=="ff", ACTION=="add",    RUN+="/System/Tasks/MtpPhone", ENV{MTP}="1"
+SUBSYSTEM=="usb", ENV{ID_MTP_DEVICE}=="1", ACTION=="add", RUN+="/System/Tasks/MtpPhone", ENV{MTP}="1"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ENV{MTP}=="1", ACTION=="remove", RUN+="/System/Tasks/MtpPhone stop"
 MTPR
     say "udev: wrote ${MTPRULE#$TREE/}"
 else
     say "udev: ${MTPRULE#$TREE/} already present (ok)"
+fi
+
+# --- 43f) Block/USB automount -> /Mount/<name> + /etc/fstab registration ------
+# The live ISO has NO auto-mount for plain USB sticks / external disks: Gobo's
+# /Mount convention + fstab auto-update are not wired, udisksd is not run, and
+# there is no GoboScripts mount wrapper -- so plugging a drive does nothing and
+# GUI gparted cannot mount it.  Fix mirrors 43a-e: a System/Tasks script invoked
+# from a udev rule (hotplug) and StartLiveCD (devices already present at boot).
+#   * device nodes live on the devtmpfs at /System/Kernel/Devices (already OK)
+#   * mount target = /Mount/<label|devname> (Gobo convention: mnt -> Mount)
+#   * fstab line appended as UUID=... with noauto,users so the desktop session
+#     can also unmount it and mount -a at boot cannot trip on the absent device.
+GOMOUNT="$TREE/System/Tasks/GoboMount"
+# Rewrite it when it is missing OR when it still has the pre-fix argument
+# handling (the task file is shipped in the ISO, so "only create when absent"
+# would keep the broken version forever).
+if [ ! -f "$GOMOUNT" ] || ! grep -q 'invokes a task as' "$GOMOUNT" 2>/dev/null; then
+    mkdir -p "$(dirname "$GOMOUNT")"
+    cat > "$GOMOUNT" <<'GOM'
+#!/bin/bash
+# GoboMount: auto-mount a USB/block storage device onto /Mount/<name> and
+# register it in /etc/fstab (GoboLinux convention; baked by livefix 43f).
+# Invoked from udev (hotplug) and StartLiveCD (scan at boot).  Idempotent;
+# a device with no filesystem, a swap partition, or an already-mounted target
+# is a no-op.
+op="$1"; dev="$2"
+# Gobo's StartTask invokes a task as `"$task" "$op" "$@"` (see /bin/StartTask),
+# so $1 is the OPERATION ("start"/"stop"), NOT the sub-command: with
+# "StartTask GoboMount" $1 is "start" and the task fell into the usage branch
+# -> "usage: GoboMount {add <dev>|remove <uuid>|scan}" and
+# "StartTask: GoboMount: Returned code 2 => FAILED." at every boot.
+# The udev rules call the task directly with "add <dev>" / "remove <uuid>".
+case "$op" in
+    start|"") op="scan" ;;   # boot-time scan of the already attached devices
+    stop)     exit 0 ;;     # nothing to undo: the mounts live in the session
+    add|remove|scan) : ;;
+    *)        echo "usage: GoboMount {add <dev>|remove <uuid>|scan}"; exit 2 ;;
+esac
+
+export PATH=/System/Index/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+LOG=/Data/Variable/log/automount.log
+FSTAB=/etc/fstab
+BLKID=/System/Index/bin/blkid
+MOUNT=/System/Index/bin/mount
+UMOUNT=/System/Index/bin/umount
+
+mkdir -p /Data/Variable/log
+note() { echo "$(date '+%F %T'): $*" >>"$LOG"; }
+
+safe_name() { echo "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -c '[:alnum:]_.-' '_' | sed 's/_\+/_/g; s/^_//; s/_$//' | cut -c1-48; }
+
+add() {
+    [ -n "$dev" ] || return 0
+    [ -b "$dev" ] || { note "add: $dev not a block device"; return 0; }
+    fstype=$("$BLKID" -o value -s TYPE "$dev" 2>/dev/null)
+    [ -n "$fstype" ] || { note "add: $dev has no filesystem (skipped)"; return 0; }
+    [ "$fstype" = "swap" ] && return 0
+
+    uuid=$("$BLKID" -o value -s UUID "$dev" 2>/dev/null)
+    label=$("$BLKID" -o value -s LABEL "$dev" 2>/dev/null)
+    name=$(safe_name "${label:-$(basename "$dev")}")
+    mp="/Mount/$name"
+
+    mountpoint -q "$mp" 2>/dev/null && { note "add: $dev already mounted at $mp"; return 0; }
+    mkdir -p "$mp"
+
+    if [ -n "$uuid" ]; then key="UUID=$uuid"; else key="$dev"; fi
+    if ! grep -q "^$key[[:space:]]" "$FSTAB" 2>/dev/null; then
+        printf '%s\t%s\t%s\trw,noauto,users,nosuid,nodev,exec\t0\t0\n' \
+            "$key" "$mp" "$fstype" >> "$FSTAB"
+        note "add: registered $key in $FSTAB"
+    fi
+
+    if "$MOUNT" -o noatime "$mp" >>"$LOG" 2>&1; then
+        note "add: mounted $dev at $mp ($fstype)"
+    else
+        note "add: FAILED to mount $dev at $mp (see above)"
+    fi
+    return 0
+}
+
+remove() {
+    # udev passes the filesystem UUID on remove (the device node is already gone).
+    [ -n "$dev" ] || return 0
+    line=$(grep "^UUID=$dev[[:space:]]" "$FSTAB" 2>/dev/null | head -1)
+    [ -n "$line" ] || return 0
+    mp=$(echo "$line" | awk '{print $2}')
+    "$UMOUNT" "$mp" >>"$LOG" 2>&1 || true
+    [ -d "$mp" ] && rmdir "$mp" 2>/dev/null || true
+    grep -v "^UUID=$dev[[:space:]]" "$FSTAB" > "$FSTAB.tmp" 2>/dev/null && mv "$FSTAB.tmp" "$FSTAB"
+    note "remove: unmounted + deregistered $dev"
+    return 0
+}
+
+scan() {
+    # Devices already attached at boot (udev also fires add events, this is a
+    # safety net for eudev policy that skips filesystem partitions on coldplug).
+    for d in /System/Kernel/Devices/sd[a-z][0-9] /System/Kernel/Devices/sd[a-z][0-9][0-9] \
+             /System/Kernel/Devices/mmcblk*[0-9] /System/Kernel/Devices/nvme*n[0-9]p[0-9]; do
+        [ -b "$d" ] || continue
+        dev="$d"; add
+    done
+    return 0
+}
+
+case "$op" in
+    add)    add ;;
+    remove) remove ;;
+    scan)   scan ;;
+    *) echo "usage: GoboMount {add <dev>|remove <uuid>|scan}"; exit 2 ;;
+esac
+GOM
+    chmod 755 "$GOMOUNT"
+    say "task baked (${GOMOUNT#$TREE/})"
+else
+    say "task already baked (${GOMOUNT#$TREE/}, ok)"
+fi
+
+# udev hotplug rule (simple eudev-safe keys, no variables).  Matches filesystem
+# partitions / whole sticks; the task re-verifies with blkid so edge cases are
+# no-ops.  remove passes the fs UUID (node is gone) for the fstab lookup.
+GOMRULE="$TREE/etc/udev/rules.d/85-gobo-mount.rules"
+if [ ! -f "$GOMRULE" ]; then
+    mkdir -p "$(dirname "$GOMRULE")"
+    cat > "$GOMRULE" <<'GOMR'
+# USB / external block automount -> /Mount/<name> + fstab (livefix 43f).
+SUBSYSTEM=="block", KERNEL=="sd[a-z]*[0-9]|mmcblk*[0-9]p[0-9]|nvme*n[0-9]p[0-9]", ENV{ID_FS_TYPE}!="", ACTION=="add",    RUN+="/System/Tasks/GoboMount add %E{DEVNAME}"
+SUBSYSTEM=="block", KERNEL=="sd[a-z]|mmcblk[0-9]|nvme[0-9]n[0-9]", ENV{ID_FS_TYPE}!="", ACTION=="add",    RUN+="/System/Tasks/GoboMount add %E{DEVNAME}"
+SUBSYSTEM=="block", ENV{ID_FS_UUID}!="", ACTION=="remove", RUN+="/System/Tasks/GoboMount remove %E{ID_FS_UUID}"
+GOMR
+    say "udev: wrote ${GOMRULE#$TREE/}"
+else
+    say "udev: ${GOMRULE#$TREE/} already present (ok)"
+fi
+
+# Boot wiring: scan for drives present at boot (StartLiveCD + BootUp, mirroring
+# the MtpPhone wiring) right after the phone task.
+for sld in "$TREE"/Programs/LiveCD/*/bin/StartLiveCD; do
+    [ -f "$sld" ] || continue
+    if ! grep -q 'StartTask GoboMount' "$sld"; then
+        sed -i '/^StartTask MtpPhone/a\msg "Mounting USB drives"\nStartTask GoboMount' "$sld"
+        say "StartLiveCD: GoboMount scan wired after MtpPhone (${sld#$TREE/})"
+    else
+        say "StartLiveCD: GoboMount scan already present (${sld#$TREE/}, ok)"
+    fi
+done
+phboot2="$TREE/Programs/BootScripts/Settings/BootScripts/BootUp"
+[ -f "$phboot2" ] || phboot2="$bdir/BootUp"
+if [ -f "$phboot2" ]; then
+    if ! grep -q 'GoboMount scan' "$phboot2"; then
+        sed -i '/MtpPhone Start/a Exec "Mounting USB drives..."              GoboMount scan' "$phboot2"
+        say "BootUp: GoboMount scan wired after MtpPhone"
+    else
+        say "BootUp: GoboMount scan already present (ok)"
+    fi
 fi
 
 # --- 44) GoboNet GUI as root/sudo: bridge the session display to uid 0 -------
@@ -3470,9 +4695,18 @@ if [ -f "$GBNDIR/gobonet" ]; then
 import sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
+# Always: prefer the zenity (GTK/xcb) dialog backend over pinentry-qt.  On this
+# ISO the Qt5 plugin tree has no real libqxcb (every copy is a ~15-21KB stub;
+# Qt 5.15.2 was built without the xcb platform plugin) and KWin 6 dropped the
+# old xdg-shell-v6, so pinentry-qt can never map a window.  GTK's own xcb stack
+# works as root over Xwayland with the gobo-root-display bridge (DISPLAY + the
+# seeded /root/.Xauthority), so the GUI password/msg dialogs actually show.
+if "! which zenity" not in s and "which pinentry &> /dev/null ;}" in s:
+    s = s.replace("which pinentry &> /dev/null ;}",
+                  "which pinentry &> /dev/null && ! which zenity &> /dev/null ;}", 1)
+    print("[livefix44] gobonet: prefer zenity over pinentry (root GUI dialog fix)")
 if "livefix 44" in s:
     print("[livefix44] gobonet already bridged")
-    sys.exit(0)
 head, sep, tail = s.partition("\n")
 if not head.startswith("#!"):
     print("[livefix44] unexpected gobonet header; skipping")
@@ -3503,47 +4737,93 @@ else
     say "zfs45.sh helper not found ($ZFS45_HELPER) - ZFS root plumbing skipped"
 fi
 
-# 46 - XIVLauncher: import the host CA bundle into the Wine prefix trust store.
-# The wrapper runs `wineboot` on a fresh prefix, whose Windows cert store starts
-# EMPTY. .NET/SChannel (Velopack self-update, Square Enix login/news, Dalamud
-# downloads) then fails every TLS handshake even while the host is online.
-# Inject an idempotent per-prefix import into the wrapper unless already there.
+# 45b/45c - Installer LUKS/ZFS/XFS support (zfs46.sh, requires zfs45) and
+# rEFInd + LVM-on-LUKS support (zfs47.sh, requires zfs46): filesystem dropdown
+# (incl. LUKS+*, LUKS+LVM+*), encryption passphrase field, GRUB cryptodisk/lvm
+# modules, and the GRUB/rEFInd bootloader chooser (rEFInd - UEFI only).
+# 48 - the installer's Qt GUI: PyQt bindings reachable from the running
+# interpreter (binding-agnostic wizard/tail port via qtcompat.py), the silent
+# TUI downgrade replaced with a reported reason, and a real menu icon. Patches
+# the same GoboLinuxInstaller that zfs46 does but a different block of it, so
+# it goes after zfs46/zfs47 in the shared loop below.
+# 49 - the Qt6 QtMultimedia QML module. Qt's own QML import root
+# (/Programs/Qt/6.10.3/qml) shipped a stale Qt5-era QtMultimedia payload
+# (qmldir naming Qt5's declarative_multimedia, plus libdeclarative_multimedia.so
+# from 2020). Qt6 read that Qt5 qmldir, failed to load the Qt5 plugin, and
+# reported the whole module as missing, so the "Login Screen (SDDM)" page in
+# systemsettings died with
+#     qrc:/lcm/kcm_sddm/main.qml:10 module "QtMultimedia" is not installed
+# zfs49.sh points that root at the real Qt6 module and also exposes it under
+# /System/Index/lib/qml (the QML2_IMPORT_PATH set by plasma-qt6.sh).
+# No-op on a Pantheon/Qt5 ISO (no /Programs/QtMultimedia). Independent of the
+# installer GUI, so it goes last.
+# 50 - rebuild the GRUB2 EFI application (isolinux/efiboot.img) so the UEFI boot
+# uses the same kernel cmdline as the working BIOS path. The shipped EFI app is a
+# stale 2020 artifact carrying a dracut cmdline (root=live:LABEL=..., rd.live.*)
+# plus video=LVDS-1:e/HDMI-1:e/VGA=1:e, which force-disable outputs; this ISO
+# actually boots via init=/linuxrc root=/dev/ram0. finalize-iso.sh only copies
+# efiboot.img, it never regenerates it, so this needs doing explicitly.
+# Touches a build artifact, not the rootfs. Skips (no-op) if the ESP already
+# carries the correct cmdline, and skips cleanly if the ISO-stage chroot is not
+# present.
+# zfs46-49 patch INSIDE the rootfs tree, so they take TREE. zfs50 does not: it
+# rebuilds work/isolinux/efiboot.img, which lives in the BUILD dir next to
+# work/, so it takes the build dir. Passing TREE to it made it look for
+# <rootfs>/work/rootfs and never find Programs/GRUB-EFI.
+BUILD_DIR="$(dirname "$(dirname "$(readlink -f "$TREE")")")"
+for ZHELPER in zfs46.sh zfs47.sh zfs48.sh zfs49.sh; do
+    ZHELPER_PATH="$(dirname "$(readlink -f "$0")")/$ZHELPER"
+    if [ -x "$ZHELPER_PATH" ]; then
+        bash "$ZHELPER_PATH" "$TREE" \
+            || say "WARNING: $ZHELPER reported an error on $TREE (check the output above)"
+    else
+        say "$ZHELPER helper not found ($ZHELPER_PATH) - skipped (see zfs${ZHELPER#zfs}.sh for what this covers)"
+    fi
+done
+
+for ZHELPER in zfs50.sh; do
+    ZHELPER_PATH="$(dirname "$(readlink -f "$0")")/$ZHELPER"
+    if [ -x "$ZHELPER_PATH" ]; then
+        bash "$ZHELPER_PATH" "$BUILD_DIR" \
+            || say "WARNING: $ZHELPER reported an error on $BUILD_DIR (check the output above)"
+    else
+        say "$ZHELPER helper not found ($ZHELPER_PATH) - skipped (see zfs${ZHELPER#zfs}.sh for what this covers)"
+    fi
+done
+
+# 46 - XIVLauncher: ensure the wrapper carries NO `wine certutil` CA-import
+# block.  See XIVLAUNCHER-WINE-FIX.md FAULT #3: the certutil import was a no-op
+# (Wine's certutil -addstore returns success without populating the store), and
+# the "not connected to the internet" symptom was really the Velopack
+# NotInstalledException (FAULT #1) misreported -- NOT a TLS problem.  .NET/
+# SChannel under Wine validates TLS against the host trust store, so no
+# per-prefix import is needed.  The recipe's "Final working wrapper" ships none;
+# earlier builds injected one here, so STRIP it if present (idempotent).
 shopt -s nullglob
 for XLF in "$TREE"/Programs/FFXIVQuickLauncher/*/bin/xivlauncher
 do
-    if ! grep -q "gobo livefix 46" "$XLF"; then
-        CA46='# gobo livefix 46: import the host CA bundle into the prefix trust store.
-# .NET/SChannel under Wine verifies TLS against the prefix'"'"'s Windows cert
-# store, which wineboot creates EMPTY; without this every HTTPS call fails
-# even while the host is online (Velopack self-update, SE login/news, Dalamud).
-CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-[ -f /System/Settings/ssl/certs/ca-certificates.crt ] && CA_BUNDLE=/System/Settings/ssl/certs/ca-certificates.crt
-CA_FLAG="$WINEPREFIX/.gobo-cacert-imported"
-if [ -f "$CA_BUNDLE" ] && [ ! -f "$CA_FLAG" ]; then
-    CA_TMP="$WINEPREFIX/.ca-import.$$"
-    rm -rf "$CA_TMP" && mkdir -p "$CA_TMP"
-    awk '"'"'/-----BEGIN CERTIFICATE-----/{n++; f=sprintf("%s/cert-%04d.pem", d, n); print > f; next} f{print > f}'"'"' d="$CA_TMP" "$CA_BUNDLE"
-    imp=0
-    for cf in "$CA_TMP"/cert-*.pem; do
-        [ -f "$cf" ] || continue
-        WINEDEBUG=-all "$WINE" certutil -addstore -f root "Z:${cf#/}" >/dev/null 2>&1 && imp=1
-    done
-    rm -rf "$CA_TMP"
-    [ "$imp" = 1 ] && touch "$CA_FLAG"
-fi
-'
-        python3 - "$XLF" "$CA46" <<'PY'
+    if grep -q "gobo livefix 46" "$XLF"; then
+        python3 - "$XLF" <<'PY'
 import sys
-xl, block = sys.argv[1], sys.argv[2]
-src = open(xl).read()
-exec_marker = 'exec "$WINE" "$APP" "$@"'
-assert exec_marker in src, "exec line not found in %s" % xl
-src = src.replace(exec_marker, block + "\n" + exec_marker)
-open(xl, "w").write(src)
-print("[livefix46] CA trust import injected into " + xl)
+p = sys.argv[1]
+lines = open(p).read().splitlines(keepends=True)
+out, skip = [], False
+for ln in lines:
+    if not skip and ln.lstrip().startswith('# gobo livefix 46'):
+        skip = True
+        continue
+    if skip:
+        # The injected block sits immediately before the launcher's exec line.
+        if ln.startswith('exec "$WINE" "$APP"'):
+            skip = False
+            out.append(ln)
+        continue
+    out.append(ln)
+open(p, "w").write("".join(out))
+print("[livefix46] stripped stale certutil CA-import block from " + p)
 PY
     else
-        say "ok (already) "${XLF#$TREE/}""
+        say "ok (no certutil block) "${XLF#$TREE/}""
     fi
 done
 shopt -u nullglob
@@ -3654,7 +4934,7 @@ case "$1" in
         chown polkitd:polkitd /run/polkit 2>/dev/null || true
         # polkitd stays in the foreground as user polkitd; setsid -f detaches it
         # so it survives the boot shell teardown (mirrors the sddm Exec line).
-        setsid -f runuser -u polkitd -- "$PK" --no-debug >>/Data/Variable/log/polkitd.log 2>&1 &
+        setsid -f runuser -u polkitd -- "$PK" >>/Data/Variable/log/polkitd.log 2>&1 &
         # give it a beat and verify (polkitd may take a moment to register).
         for _p in 1 2 3 4 5 6 7 8; do
             pgrep -xc polkitd >/dev/null 2>&1 && break
@@ -3686,7 +4966,7 @@ chmod 755 "$polkit_task"
 # user polkitd, so a root-spawned polkitd would be denied ownership).
 for svc in "$TREE"/Programs/Polkit/*/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
     [ -f "$svc" ] || continue
-    sed -i 's#^Exec=.*#Exec=/Programs/Polkit/'"$POLKIT_VER"'/lib/polkit-1/polkitd --no-debug#' "$svc"
+    sed -i 's#^Exec=.*#Exec=/Programs/Polkit/'"$POLKIT_VER"'/lib/polkit-1/polkitd#' "$svc"
     sed -i 's/^User=.*/User=polkitd/' "$svc"
 done
 # Wire Polkit Start into StartLiveCD (live boot path; right after Elogind so
@@ -3734,6 +5014,37 @@ done
 chown 1000:1000 "$TREE/Users/live" "$TREE/Users/live/"* 2>/dev/null || true
 say "XDG user dirs provisioned in skel + /Users/live"
 
+# --- 50a) Register Firefox as the ISO default web browser -------------
+# Electron apps (Claude Desktop, etc.) open OAuth/external URLs through
+# xdg-open. With no default browser registered, clicking "Continue with
+# Google" in Claude silently does nothing (no window pops up). Seed the
+# system xdg config (/etc/xdg = System/Settings/xdg) AND the live-user
+# profile + EnhancedSkel so http/https/text/html resolve to firefox.desktop
+# (baked and Indexed at /System/Index/share/applications/firefox.desktop).
+cat > "$TREE/etc/xdg/mimeapps.list" <<'EOF'
+[Default Applications]
+x-scheme-handler/http=firefox.desktop;
+x-scheme-handler/https=firefox.desktop;
+text/html=firefox.desktop;
+application/xhtml+xml=firefox.desktop;
+EOF
+say "xdg: firefox.desktop set as system default browser (/etc/xdg/mimeapps.list)"
+
+mkdir -p "$TREE/Users/live/.config"
+cat > "$TREE/Users/live/.config/mimeapps.list" <<'EOF'
+[Default Applications]
+x-scheme-handler/http=firefox.desktop;
+x-scheme-handler/https=firefox.desktop;
+text/html=firefox.desktop;
+application/xhtml+xml=firefox.desktop;
+EOF
+chown 1000:1000 "$TREE/Users/live/.config" 2>/dev/null || true
+[ -d "$skel_dir" ] && {
+    mkdir -p "$skel_dir/.config"
+    cp -a "$TREE/Users/live/.config/mimeapps.list" "$skel_dir/.config/mimeapps.list"
+}
+say "xdg: live-user default browser set (Users/live + EnhancedSkel)"
+
 # --- 51) Repair stale /System/Tasks symlinks (host-path leftovers) ----------
 # Section 41's guard `[ -e ] || [ -L ] ||` SKIPS when ANY symlink exists, so
 # stale links that point at the build-host path (/Mount/gobo-build/...) survive
@@ -3757,4 +5068,1127 @@ for link in "$TREE"/System/Tasks/*; do
     esac
 done
 
+# --- 52) knshandler: KNS dependency installer reachable from kpackage --------
+# kpackage's resolveHandler() looks for the 'kns' scheme handler at the path
+# baked into libKF6Package.so (QStringLiteral(KDE_INSTALL_FULL_LIBEXECDIR_KF
+# "/kpackagehandlers") = /Programs/KPackage/<ver>/libexec/kf6/kpackagehandlers).
+# The handler itself ships from FrameworkIntegration, so nothing would be found
+# and every global-theme dependency install would fail with
+# "Could not install dependency: 'kns://...'". Link it into KPackage's own
+# libexec dir (version-aware via Current, matches the baked literal).
+KP_VER=$(basename "$(readlink "$TREE/Programs/KPackage/Current" 2>/dev/null || echo 6.26.0)")
+FI_HANDLER="$TREE/Programs/FrameworkIntegration/Current/libexec/kf6/kpackagehandlers/knshandler"
+KP_DEST="$TREE/Programs/KPackage/$KP_VER/libexec/kf6/kpackagehandlers"
+if [ -x "$FI_HANDLER" ]; then
+    mkdir -p "$KP_DEST"
+    if [ ! -e "$KP_DEST/knshandler" ] && [ ! -L "$KP_DEST/knshandler" ]; then
+        ln -sfn "/Programs/FrameworkIntegration/Current/libexec/kf6/kpackagehandlers/knshandler" "$KP_DEST/knshandler"
+        say "linked ${KP_DEST#$TREE/}/knshandler -> FrameworkIntegration handler"
+    else
+        say "knshandler already reachable at ${KP_DEST#$TREE/}/knshandler"
+    fi
+else
+    say "WARNING: FrameworkIntegration handler missing ($FI_HANDLER); KNS deps will still fail"
+fi
+
+# --- 53) aurorae.knsrc: KNS provider for Aurorae window decorations ----------
+# Global-theme (look-and-feel) metadata declares dependencies such as
+# 'kns://aurorae.knsrc/...' (e.g. Sweet -> Sweet Aurorae). KNewStuff resolves
+# those only if the knsrc file exists in the DATA knsrcfiles dir, which on this
+# ISO resolves through /System/Index/share/knsrcfiles (knsrcfiles is a merged
+# symlink dir rebuilt by refresh-merge from PACKAGES only). refresh-merge runs
+# BEFORE step_livefix, so a Program-dir-only write is never indexed and the
+# dep still fails on the baked ISO; write BOTH the Program dir AND the index
+# symlink dir. Mirrors upstream KDE/aurorae aurorae.knsrc.cmake (alias of
+# window-decorations) but with the ISO's own kwin adoption command.
+KW_VER=$(basename "$(readlink "$TREE/Programs/KWin/Current" 2>/dev/null || echo 6.7.4)")
+AUR_KNS_SRC=""
+for cand in \
+    "$TREE/Programs/Plasma-Workspace/$KW_VER/share/knsrcfiles" \
+    "$TREE/Programs/Plasma-Workspace/$(basename "$(readlink "$TREE/Programs/Plasma-Workspace/Current" 2>/dev/null || echo 6.7.4)")/share/knsrcfiles" \
+    "$TREE/Programs/KWin/$KW_VER/share/knsrcfiles"
+do
+    [ -d "$cand" ] && { AUR_KNS_SRC="$cand"; break; }
+done
+IDX_KNS="$TREE/System/Index/share/knsrcfiles"
+if [ -n "$AUR_KNS_SRC" ]; then
+    if [ ! -e "$AUR_KNS_SRC/aurorae.knsrc" ]; then
+        cat > "$AUR_KNS_SRC/aurorae.knsrc" <<'EOF'
+[KNewStuff3]
+Name=Aurorae Window Decorations
+AliasFor=window-decorations
+ProvidersUrl=https://autoconfig.kde.org/ocs/providers.xml
+ContentWarning=Executables
+Categories=Window Decoration Aurorae
+Uncompress=archive
+TargetDir=aurorae/themes
+EOF
+        echo "AdoptionCommand=/Programs/KWin/$KW_VER/libexec/kwin-applywindowdecoration %f" >> "$AUR_KNS_SRC/aurorae.knsrc"
+        say "wrote aurorae.knsrc in ${AUR_KNS_SRC#$TREE/}"
+    else
+        say "aurorae.knsrc already present in ${AUR_KNS_SRC#$TREE/}"
+    fi
+    if [ -d "$IDX_KNS" ] && [ ! -e "$IDX_KNS/aurorae.knsrc" ] && [ ! -L "$IDX_KNS/aurorae.knsrc" ]; then
+        ln -s "/${AUR_KNS_SRC#$TREE/}/aurorae.knsrc" "$IDX_KNS/aurorae.knsrc"
+        say "linked /System/Index/share/knsrcfiles/aurorae.knsrc -> /${AUR_KNS_SRC#$TREE/}/aurorae.knsrc"
+    else
+        say "aurorae.knsrc already indexed, or no index knsrcfiles dir ($IDX_KNS)"
+    fi
+else
+    say "WARNING: no Plasma-Workspace/KWin knsrcfiles dir; aurorae window decorations will not install"
+fi
+
+# --- 54) plasmoid packages for QML applets (share/plasma/plasmoids) ----------
+# 'make install' of plasma-desktop/plasma-nm skipped the data packages for the
+# QML-based applets (plasma_add_applet bails for plugin-less QML modules), so
+# the shell found their QML modules under lib/qml/... but KPackage (structure
+# plasma_applet.so: defaultPackageRoot = data/plasma/plasmoids) could not list
+# or load them: "Add Widgets" was empty and panel applets failed to resolve.
+# Wrap each existing module into a data package (metadata.json + contents/ui ->
+# module dir) so the applets become installable/loadable again.
+add_qml_applet_package() {
+    local owner="$1"    # program dir name under Programs/
+    local id="$2"       # applet id, e.g. org.kde.plasma.taskmanager
+    local name="$3"     # human name
+    local icon="${4:-}"
+    local ver dir mod pkg md modtag
+    case "$owner" in
+        Plasma-Desktop|Plasma-NM|Plasma-PA|Plasma-Workspace) ;;
+        *) say "  skip $id: unknown owner $owner"; return ;;
+    esac
+    dir="$TREE/Programs/$owner/Current"
+    [ -d "$dir" ] || return 0
+    ver=$(basename "$(readlink "$dir" 2>/dev/null || echo 6.7.4)")
+    modtag="${id##*.}"
+    mod="$TREE/Programs/$owner/$ver/lib/qml/plasma/applet/org/kde/plasma/$modtag"
+    pkg="$TREE/Programs/$owner/$ver/share/plasma/plasmoids/$id"
+    idx="$TREE/System/Index/share/plasma/plasmoids/$id"
+    [ -d "$mod" ] || return 0                       # module not built here
+    # systemtray is a CustomEmbedded CONTAINMENT, not a plain applet: the
+    # X-Plasma-ContainmentType key is what makes the shell instantiate it
+    # as one (SystemTray : Plasma::Containment). Without it plasmashell
+    # logs "Loaded as an applet, this shouldn't have happened" and the tray
+    # renders nothing (and its sound/network items disappear with it).
+    local ctype=""
+    local provides=""
+    [ "$id" = "org.kde.plasma.systemtray" ] && ctype='    "X-Plasma-ContainmentType": "CustomEmbedded",
+'
+    # Plasma groups "Show Alternatives..." by X-Plasma-Provides. The launchers
+    # (upstream kickoff/kicker/kickerdash) all declare
+    # X-Plasma-Provides=org.kde.plasma.launchermenu, so without the key the
+    # panel's alternative chooser has nothing to list. Upstream `make install`
+    # skips these plugin-less QML applets entirely, so we synthesise the
+    # metadata; always (re)stamp launchers because earlier livefix runs wrote
+    # the key-less form above and the merge reuses the persisted metadata.json.
+    case "$id" in
+        org.kde.plasma.kickoff|org.kde.plasma.kicker|org.kde.plasma.kickerdash)
+            provides='    "X-Plasma-Provides": ["org.kde.plasma.launchermenu"],
+'
+            ;;
+    esac
+    local need_write=0
+    if [ ! -e "$pkg/metadata.json" ]; then
+        need_write=1
+    elif [ -n "$provides" ] && ! grep -q 'X-Plasma-Provides' "$pkg/metadata.json" 2>/dev/null; then
+        need_write=1
+    fi
+    if [ "$need_write" = 1 ]; then
+        mkdir -p "$pkg"
+        printf '{\n    "KPackageStructure": "Plasma/Applet",\n    "KPlugin": {\n        "Id": "%s",\n        "Name": "%s",\n        "Description": "Plasma widget",\n        "Icon": "%s"\n    },\n%s%s    "X-Plasma-API-Minimum-Version": "6.0"\n}\n' \
+            "$id" "$name" "${icon:-$id}" "$ctype" "$provides" > "$pkg/metadata.json"
+        [ -e "$pkg/contents" ] || [ -L "$pkg/contents" ] || \
+            ln -s "../../../../lib/qml/plasma/applet/org/kde/plasma/$modtag" "$pkg/contents"
+        say "  packaged $id from $owner QML module -> share/plasma/plasmoids"
+    fi
+    # refresh-merge rebuilds /System/Index from package tarballs BEFORE this
+    # section runs (step_livefix is post-merge), so a booted ISO never sees a
+    # livefix-only package. Mirror into the merged index dir -- the finalize
+    # squash packs work/rootfs as-is, so the symlink is baked into the image.
+    if [ ! -e "$idx" ] && [ ! -L "$idx" ]; then
+        mkdir -p "$(dirname "$idx")" 2>/dev/null || true
+        [ -d "$(dirname "$idx")" ] && ln -s "/Programs/$owner/$ver/share/plasma/plasmoids/$id" "$idx"
+        say "  indexed $id into /System/Index/share/plasma/plasmoids"
+    fi
+}
+# --- 55) bake Plasma-Workspace QML applet modules from the persisted compile ---
+# tree. The Plasma-Workspace package tarball predates the recipe pre_link that
+# now salvages these modules, so no baked ISO has clock/notifications/systemtray
+# etc., and the default panel (which references them) dies whenever a theme is
+# applied. The module trees still exist in the chroot build dir, so copy them
+# here during merge until a proper package rebuild ships them; add_qml_applet
+# _package (above) then packages + indexes each. Self-disabling once the
+# tarball contains the modules (they will already exist under the Program dir).
+say "baking Plasma-Workspace QML applet modules (rebuild fallback):"
+{
+    CHROOT="$(dirname "$(dirname "$TREE")")"
+    WS_VER="$(basename "$(readlink "$TREE/Programs/Plasma-Workspace/Current" 2>/dev/null || echo 6.7.4)")"
+    WS_DST="$TREE/Programs/Plasma-Workspace/$WS_VER/lib/qml/plasma/applet/org/kde/plasma"
+    WS_SRC="$(echo "$CHROOT"/rootfs/Data/Compile/Sources/plasma-workspace-*/_build/bin/plasma/applet/org/kde/plasma)"
+    if [ -d "$WS_SRC" ]; then
+        mkdir -p "$WS_DST"
+        while IFS= read -r m; do
+            t="${m##*/}"
+            case "$t" in
+                digitalclock|notifications|systemtray|clipboard|appmenu|devicenotifier|calendar|analogclock|icon|activitybar|manage-inputmethod|lock_logout|mediacontroller|panelspacer|marginsseparator|cameraindicator) ;;
+                *) continue ;;
+            esac
+            [ -e "$WS_DST/$t" ] && continue
+            cp -a "$m" "$WS_DST/$t"
+            say "  baked workspace module $t"
+        done < <(find "$WS_SRC" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    else
+        say "  WARNING: no workspace build tree at $WS_SRC; workspace applets unavailable until rebuild"
+    fi
+
+    # plasma-pa has the identical plugin-less QML quirk: raise to 100%
+    # intentionally never installs its QML module, and the plasma-pa tarball
+    # predates pre_link, so the volume (sound) applet is missing from every
+    # baked ISO. Its module tree survives in the chroot build dir -> copy it.
+    PA_VER="$(basename "$(readlink "$TREE/Programs/Plasma-PA/Current" 2>/dev/null || echo 6.7.4)")"
+    PA_DST="$TREE/Programs/Plasma-PA/$PA_VER/lib/qml/plasma/applet/org/kde/plasma"
+    PA_SRC="$(echo "$CHROOT"/rootfs/Data/Compile/Sources/plasma-pa-*/_build/bin/plasma/applet/org/kde/plasma)"
+    if [ -d "$PA_SRC" ]; then
+        mkdir -p "$PA_DST"
+        while IFS= read -r m; do
+            t="${m##*/}"
+            [ "$t" = "volume" ] || continue
+            [ -e "$PA_DST/$t" ] && continue
+            cp -a "$m" "$PA_DST/$t"
+            say "  baked plasma-pa module $t"
+        done < <(find "$PA_SRC" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    else
+        say "  WARNING: no plasma-pa build tree at $PA_SRC; volume applet unavailable until rebuild"
+    fi
+}
+say "packaging QML applets as Plasma/Applet packages:"
+add_qml_applet_package Plasma-Desktop org.kde.plasma.taskmanager "Icons-and-Text Task Manager" preferences-system-windows
+add_qml_applet_package Plasma-Desktop org.kde.plasma.kickoff "Application Launcher" start-here-kde
+add_qml_applet_package Plasma-Desktop org.kde.plasma.kicker "Application Menu" start-here-kde
+add_qml_applet_package Plasma-Desktop org.kde.plasma.pager "Desktop Pager" pager
+add_qml_applet_package Plasma-Desktop org.kde.plasma.showdesktop "Show Desktop" desktop
+add_qml_applet_package Plasma-Desktop org.kde.plasma.windowlist "Window List" view-list-details
+add_qml_applet_package Plasma-Desktop org.kde.plasma.trash "Trash" user-trash
+add_qml_applet_package Plasma-Desktop org.kde.plasma.keyboardlayout "Keyboard Layout" preferences-desktop-keyboard
+add_qml_applet_package Plasma-Desktop org.kde.plasma.kimpanel "Input Method Panel" input-keyboard
+add_qml_applet_package Plasma-Desktop org.kde.plasma.showActivityManager "Show Activity Manager" preferences-system-activities
+add_qml_applet_package Plasma-NM org.kde.plasma.networkmanagement "Networks" network-wireless
+# Plasma-PA: volume (sound) applet - module baked by §55 above.
+add_qml_applet_package Plasma-PA org.kde.plasma.volume "Sound" audio-volume-high
+# --- 54.5) default panel must surface sound + network (they were never in the
+# layout template, so neither icon ever appeared). Insert them next to the
+# system tray; re-assert idempotently since post-merge the Package tarball
+# would otherwise restore the pristine defaultPanel template.
+DP_VER="$(basename "$(readlink "$TREE/Programs/Plasma-Desktop/Current" 2>/dev/null || echo 6.7.4)")"
+DP_LAY="$TREE/Programs/Plasma-Desktop/$DP_VER/share/plasma/layout-templates/org.kde.plasma.desktop.defaultPanel/contents/layout.js"
+if [ -f "$DP_LAY" ]; then
+    for w in org.kde.plasma.volume org.kde.plasma.networkmanagement; do
+        grep -q "addWidget(\"$w\")" "$DP_LAY" || \
+            sed -i "s#panel.addWidget(\"org.kde.plasma.systemtray\")#panel.addWidget(\"$w\")\npanel.addWidget(\"org.kde.plasma.systemtray\")#" "$DP_LAY"
+    done
+    say "default panel: ensured volume + networkmanagement applets in $DP_LAY"
+else
+    say "WARNING: defaultPanel template not found ($DP_LAY)"
+fi
+# Plasma-Workspace applets: same plugin-less QML quirk. The codes have been
+# present under builddir since the Sep 9 build, but Plasma-Workspace's package
+# tarball predates pre_link(), so its QML modules never landed in the ISO --
+# add_qml_applet_package stays silent until a rebuilt tarball provides them.
+add_qml_applet_package Plasma-Workspace org.kde.plasma.digitalclock "Digital Clock" clock
+add_qml_applet_package Plasma-Workspace org.kde.plasma.notifications "Notifications" preferences-desktop-notification
+add_qml_applet_package Plasma-Workspace org.kde.plasma.systemtray "System Tray" system-run
+add_qml_applet_package Plasma-Workspace org.kde.plasma.clipboard "Clipboard" edit-paste
+add_qml_applet_package Plasma-Workspace org.kde.plasma.appmenu "Application Menu" application-menu
+add_qml_applet_package Plasma-Workspace org.kde.plasma.devicenotifier "Device Notifier" drive-removable-media
+add_qml_applet_package Plasma-Workspace org.kde.plasma.calendar "Calendar" calendar
+add_qml_applet_package Plasma-Workspace org.kde.plasma.analogclock "Analog Clock" clock
+add_qml_applet_package Plasma-Workspace org.kde.plasma.icon "Icon" icon
+add_qml_applet_package Plasma-Workspace org.kde.plasma.activitybar "Activity Bar" activities
+add_qml_applet_package Plasma-Workspace org.kde.plasma.manage-inputmethod "Input Method Panel" config-language
+add_qml_applet_package Plasma-Workspace org.kde.plasma.lock_logout "Lock/Logout" system-lock-screen
+add_qml_applet_package Plasma-Workspace org.kde.plasma.mediacontroller "Media Controller" multimedia-player
+add_qml_applet_package Plasma-Workspace org.kde.plasma.panelspacer "Panel Spacer" resize-horizontal
+add_qml_applet_package Plasma-Workspace org.kde.plasma.marginsseparator "Margins Separator" format-horizontal-align-left
+add_qml_applet_package Plasma-Workspace org.kde.plasma.cameraindicator "Camera Indicator" camera-web
+
+# --- 56) install the NVIDIA kernel modules into the LIVE module tree ----------
+# The 580 recipe ships its modules under its own Resources/Unmanaged
+# (lib/modules/<kver>/kernel/drivers/video/nvidia{,,-modeset,-drm,-uvm,-peermem}.ko),
+# which Gobo's installer copies to / at install time. A LIVE merged rootfs never
+# runs that copy, so the modules stayed ONLY under
+# Programs/Nvidia/Current/Resources/Unmanaged/... and the active tree
+# (/lib/modules -> /System/Index/lib/modules, the real dir refresh-merge.py
+# depmods) had NO nvidia.ko at all -- while everything that *consumes* it was
+# present and took priority: libGLX/libEGL_nvidia, nvidia_drv.so, and the
+# 10_/15_/20_nvidia*.json glvnd vendors that sort ahead of Mesa's 50_mesa.json.
+# On any NVIDIA box that is a GL stack whose kernel half can never load:
+# modprobe fails, yet glvnd/GLX still hand EGL+GL to it -- which is precisely the
+# kind of half-present driver that takes SDDM's greeter down to a black screen,
+# on hybrid laptops even when the display is driven by the Intel iGPU.
+# refresh-merge.py already depmods this tree "so the merged kernel modules (e.g.
+# NVIDIA) are found by modprobe", but at that point there was nothing to index.
+# Copy them in here instead -- i.e. AFTER refresh-merge.py built the initramfs.
+# That ordering is deliberate and required: Dracut 103's dracut-install
+# infinite-loops at 100% CPU when uncompressed NVIDIA .ko files sit in an
+# otherwise zstd-compressed tree (see refresh-merge.py), and nothing after this
+# script rebuilds the initramfs, so the modules are safe here.
+# depmod must also re-run, or modules.dep/modules.alias lack the new entries and
+# modprobe/udev cannot resolve them. -b targets the tree without chrooting.
+# Idempotent: re-copying is skipped when the modules are already in place, and
+# depmod only re-runs when we actually added something or the metadata is still
+# missing the nvidia entries.
+say "installing NVIDIA kernel modules into the live module tree:"
+{
+    NV_MODSRC_ROOT="$TREE/Programs/Nvidia/Current/Resources/Unmanaged/lib/modules"
+    if [ ! -d "$NV_MODSRC_ROOT" ]; then
+        say "  no NVIDIA program in this image (Unmanaged module tree absent); skipping"
+    else
+        # Same release refresh-merge.py picks: the first REAL (non-symlink)
+        # module dir. /lib/modules/<other-kver> is a symlink into OpenZFS etc.
+        NV_KVER=""
+        # Kernel release the ISO actually boots. Take it from the Linux PROGRAM
+        # (the authoritative module tree) rather than the /System/Index farm,
+        # and never let the glob end in '/'. Two traps, both of which bit this:
+        #  * a trailing slash makes the kernel resolve a symlink before lstat,
+        #    so `test -L modules/7.1.5/` reports FALSE and a symlinked release
+        #    masquerades as a real directory. Inside the build chroot
+        #    System/Index/lib/modules/7.1.5 is a symlink to the OpenZFS module
+        #    tree and it RESOLVES there, so the old check happily selected
+        #    7.1.5 (alphabetically first) and every later path built on it
+        #    pointed at a release Linux does not even ship.
+        #  * those index entries are symlinks to ABSOLUTE /Programs/... paths,
+        #    which dangle from the build host -- so the very same loop selected
+        #    7.2.5 on the host and 7.1.5 in the chroot, making the difference
+        #    impossible to reproduce from outside the build.
+        for d in "$TREE"/Programs/Linux/Current/lib/modules/*; do
+            [ -d "$d" ] && { NV_KVER="$(basename "$d")"; break; }
+        done
+        if [ -z "$NV_KVER" ]; then
+            # Fallback: the index farm, same no-trailing-slash rule.
+            for d in "$TREE"/System/Index/lib/modules/*; do
+                [ -d "$d" ] && [ ! -L "$d" ] && { NV_KVER="$(basename "$d")"; break; }
+            done
+        fi
+        if [ -z "$NV_KVER" ]; then
+            say "  WARNING: no real module dir under System/Index/lib/modules; cannot place NVIDIA modules"
+        else
+            NV_SRC="$NV_MODSRC_ROOT/$NV_KVER/kernel/drivers/video"
+            # Destination is the REAL kernel-module tree, NOT
+            # $TREE/System/Index/lib/modules/$NV_KVER/kernel/...: that 'kernel'
+            # entry is a symlink whose target is the ABSOLUTE path
+            # /Programs/Linux/<ver>/lib/modules/<kver>/kernel, i.e. rooted at the
+            # LIVE filesystem. From the build host it is a DANGLING symlink, so
+            # mkdir/cp through it fails -- and it is only resolvable from inside
+            # the tree. Programs/Linux/Current is the same directory that path
+            # resolves to at runtime (and the same one the 580 recipe writes),
+            # so writing here lands exactly where /lib/modules/$kver/kernel
+            # points once the ISO is running.
+            NV_DST="$TREE/Programs/Linux/Current/lib/modules/$NV_KVER/kernel/drivers/video"
+            if [ ! -d "$NV_SRC" ]; then
+                # Driver built, but not for this kernel: the recipe keeps one
+                # tree per kernel it built against, so say which ones exist.
+                say "  WARNING: NVIDIA has no modules for kernel $NV_KVER (built: $(ls "$NV_MODSRC_ROOT" 2>/dev/null | tr '\n' ' ')); skipping"
+            else
+                # Never mkdir blindly here. If Programs/Linux/Current does not
+                # resolve (missing/broken symlink), `mkdir -p` would invent a
+                # brand-new module tree that nothing at runtime ever reads, and
+                # every copy below would report success while having no effect.
+                if [ ! -d "$TREE/Programs/Linux/Current/lib/modules/$NV_KVER" ]; then
+                    say "  WARNING: Programs/Linux/Current does not resolve to a module tree; cannot place NVIDIA modules"
+                else
+                mkdir -p "$NV_DST"
+                NV_ADDED=0
+                for m in "$NV_SRC"/nvidia*.ko; do
+                    [ -e "$m" ] || continue
+                    t="$NV_DST/${m##*/}"
+                    [ -e "$t" ] && continue
+                    cp -a "$m" "$t" && { say "  + ${m##*/}"; NV_ADDED=$((NV_ADDED+1)); }
+                done
+                # modules.dep(.bin) is the index modprobe/udev actually read, and
+                # it is currently generated WITHOUT the NVIDIA modules (their
+                # bytes were never in the tree when refresh-merge.py depmod'd it).
+                # It MUST be regenerated from inside the tree: `depmod -b $TREE`
+                # would resolve that same dangling 'kernel' symlink, silently
+                # find zero modules and OVERWRITE a good modules.dep with an
+                # empty one -- breaking every other driver on the ISO. Only a
+                # chroot makes the absolute symlink resolve, so that is the only
+                # form used here.
+                NV_MODDIR_REL="lib/modules/$NV_KVER"
+                if [ "$NV_ADDED" -gt 0 ] || ! grep -q 'drivers/video/nvidia\.ko' "$TREE/$NV_MODDIR_REL/modules.dep" 2>/dev/null; then
+                    mkdir -p "$TREE/Data/Variable/log"
+                    NV_DLOG="$TREE/Data/Variable/log/nvidia-depmod.log"
+                    if [ -x "$TREE/sbin/depmod" ] && command -v chroot >/dev/null 2>&1 \
+                       && chroot "$TREE" /sbin/depmod "$NV_KVER" 2>>"$NV_DLOG"; then
+                        say "  depmod regenerated module metadata for $NV_KVER"
+                    else
+                        # Fallback for when chroot is unavailable or fails. Run
+                        # depmod against the LINUX PROGRAM tree: it resolves
+                        # completely on the host, whereas the index farm's
+                        # 'kernel' entry is an absolute symlink that dangles
+                        # here. Never point `depmod -b` at the index tree --
+                        # it would traverse nothing, find zero modules and
+                        # overwrite a good modules.dep with an empty one,
+                        # breaking every other driver on the ISO. The freshly
+                        # generated metadata is then copied into the index
+                        # module dir, which is what /lib/modules/<kver>
+                        # resolves to. Only plain files are replaced; build,
+                        # kernel, source, modules.builtin and modules.order
+                        # stay symlinks into the Linux program.
+                        if command -v depmod >/dev/null 2>&1 \
+                           && depmod -b "$TREE/Programs/Linux/Current" "$NV_KVER" 2>>"$NV_DLOG"; then
+                            for f in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+                                     modules.symbols modules.symbols.bin modules.softdep \
+                                     modules.devname modules.weakdep; do
+                                [ -f "$TREE/Programs/Linux/Current/lib/modules/$NV_KVER/$f" ] &&
+                                    cp -f "$TREE/Programs/Linux/Current/lib/modules/$NV_KVER/$f" \
+                                          "$TREE/$NV_MODDIR_REL/$f" 2>/dev/null
+                            done
+                            say "  depmod regenerated module metadata for $NV_KVER (Linux-program fallback)"
+                        else
+                            say "  WARNING: depmod failed for $NV_KVER; NVIDIA modules copied but modules.dep NOT"
+                            say "           regenerated, so modprobe cannot find them (see Data/Variable/log/nvidia-depmod.log)"
+                        fi
+                    fi
+                else
+                    say "  already present and indexed; no copy needed"
+                fi
+                if grep -q 'drivers/video/nvidia\.ko' "$TREE/$NV_MODDIR_REL/modules.dep" 2>/dev/null; then
+                    say "  OK: nvidia.ko is in the live tree and indexed"
+                else
+                    say "  WARNING: nvidia.ko still not indexed; NVIDIA acceleration will not load"
+                fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# --- 57) SDDM-KCM polkit action: assert the generated .policy is reachable ---
+# Installing an SDDM theme from the "Login Screen (SDDM)" systemsettings page
+# (and the standalone sddmthemeinstaller) escalates through KAuth::Action, which
+# requires a polkit policy to already be registered:
+#     org.kde.kcontrol.kcmsddm.{save,installtheme,uninstalltheme,sync,reset}
+# That policy is NOT a file in the sddm-kcm tarball -- KDE generates it at
+# install time from kcm_sddm.actions via kauth_install_actions()
+# (CMakeLists.txt:42), and on this ISO that macro emitted nothing. So the helper
+# binary and the D-Bus service were present while the policy was not, and KAuth
+# aborted with
+#     The backend does not specify how to authorize
+# *before* any password prompt: no dialog, KCM says "Unable to install theme",
+# sddmthemeinstaller exits 255. It looks like a missing polkit agent; it is not.
+# build.sh's install_kcmsddm_policy() generates it into the SDDM-KCM program tree
+# so CreatePackage ships it and the index farm links it on every boot.
+# This section is a guard, not a fix: it verifies the link actually materialised
+# in the merged tree, because a policy sitting in the package but never indexed
+# fails in exactly the same silent way as never generating it at all.
+{
+    say "checking the SDDM-KCM polkit action is installed:"
+    KCMSDDM_POLICY=org.kde.kcontrol.kcmsddm.policy
+    if [ ! -d "$TREE/Programs/SDDM-KCM" ]; then
+        say "  no SDDM-KCM in this image (not a Plasma ISO); skipping"
+    else
+        KCMSDDM_FOUND=""
+        for p in "$TREE/System/Index/share/polkit-1/actions/$KCMSDDM_POLICY" \
+                 "$TREE/usr/share/polkit-1/actions/$KCMSDDM_POLICY"; do
+            # The index farm links the policy by ABSOLUTE path (/Programs/...),
+            # which only resolves inside the ISO -- [ -f ] on the link fails on
+            # the host tree.  Translate an absolute link target back under $TREE
+            # so the file can actually be read/parsed here.
+            rp="$p"
+            if [ -L "$p" ]; then
+                lt=$(readlink "$p")
+                case "$lt" in /*) rp="$TREE$lt";; esac
+            fi
+            [ -f "$rp" ] && { KCMSDDM_FOUND="$rp"; break; }
+        done
+        if [ -n "$KCMSDDM_FOUND" ]; then
+            # Readable AND complete: an empty or truncated file would let polkitd
+            # register nothing while looking present on disk.  Validate the shape
+            # build.sh's install_kcmsddm_policy emits -- kauth-policy-gen emits NO
+            # <annotate> (build.sh rejects one), so require the auth_admin default
+            # + close tag instead of an annotate that must not be there.
+            KCMSDDM_ACTIONS=$(grep -c '<action id=' "$KCMSDDM_FOUND" 2>/dev/null || echo 0)
+            if [ "$KCMSDDM_ACTIONS" -ge 5 ] \
+               && grep -q '<allow_active>auth_admin</allow_active>' "$KCMSDDM_FOUND" \
+               && grep -q '</policyconfig>' "$KCMSDDM_FOUND"; then
+                say "  OK: $KCMSDDM_POLICY indexed with $KCMSDDM_ACTIONS actions"
+            else
+                say "  WARNING: $KCMSDDM_POLICY is present but incomplete ($KCMSDDM_ACTIONS actions);"
+                say "           theme install will fail with 'does not specify how to authorize'"
+            fi
+        else
+            say "  WARNING: $KCMSDDM_POLICY is NOT indexed under /usr/share/polkit-1/actions."
+            say "           Theme install/uninstall WILL fail with"
+            say "           'The backend does not specify how to authorize'."
+            say "           Fix: build.sh install_kcmsddm_policy must run BEFORE package SDDM-KCM."
+        fi
+    fi
+}
+
+# --- 57) KDE defaults: window decorations, effects, and panel UX ----------------
+# Fix X11 window decoration issues (missing titlebar/buttons) and improve UX.
+# Set defaults for live user (applied to the merged rootfs for live+root profiles).
+kde_defaults_live() {
+    local home="$1"
+    local cfg="$home/.config"
+    mkdir -p "$cfg"
+    # kwinrc defaults
+    local kwinrc="$cfg/kwinrc"
+    if [ ! -f "$kwinrc" ]; then
+        cat > "$kwinrc" <<'EOF'
+[Windows]
+BorderlessMaximizedWindows=false
+TitlebarDoubleClickCommand=Maximize
+EOF
+    fi
+    # Ensure Breeze decoration is preferred if not set
+    grep -q '^\[org\.kde\.kdecoration2\]' "$kwinrc" 2>/dev/null || {
+        cat >> "$kwinrc" <<'EOF'
+[org.kde.kdecoration2]
+library=org.kde.breeze
+theme=Breeze
+EOF
+    }
+    # Compositing: [Compositing] Enabled is a real KWin 6 group (kwin.kcfg).
+    # [DesktopEffects] is NOT a KWin 6 group (it was removed after KDE4); the
+    # effect enable state lives in [Plugins] <effectId>Enabled. Write the
+    # correct keys so the Overview effect (the top-left hot corner) is on.
+    # NOTE: Overview's compiled default BorderActivate is ElectricTopLeft
+    # (overviewconfig.kcfg), and its EnabledByDefault is true, so the corner is
+    # already the default -- we only make the enable state explicit.
+    local kwinrc_effects="$cfg/kwinrc"
+    grep -q '^\[Compositing\]' "$kwinrc_effects" 2>/dev/null || cat >> "$kwinrc_effects" <<'EOF'
+[Compositing]
+Enabled=true
+EOF
+    grep -q '^\[Plugins\]' "$kwinrc_effects" 2>/dev/null || cat >> "$kwinrc_effects" <<'EOF'
+[Plugins]
+overviewEnabled=true
+EOF
+    # plasma-org.kde.plasma.desktop-appletsrc for panel defaults if needed
+    local panelrc="$cfg/plasma-org.kde.plasma.desktop-appletsrc"
+    # Don't overwrite existing panel config
+    : > /dev/null
+}
+for h in "$TREE/Users/live" "$TREE/Users/root"; do
+    [ -d "$h" ] || continue
+    kde_defaults_live "$h"
+done
+say "KDE defaults applied for live+root"
+
+# --- 58) Mesa lib/dri completeness: guarantee the Intel iris driver -----------
+# Real-hardware finding (Acer laptop: Intel HD 630 + NVIDIA GTX 1060 Mobile).
+# The built-in panel (eDP-1) hangs off the Intel iGPU (card1), so section 31
+# pins KWin to it (KWIN_DRM_DEVICES=/dev/dri/card1).  But the shipped Mesa was
+# configured -Dgallium-drivers=llvmpipe,radeonsi,virgl,iris in the recipe while
+# the build only ever compiled llvmpipe/radeonsi/virgl: the meson _build dir
+# was stale, so no lib/dri/iris_dri.so was installed.  i915 still binds and
+# hands out a DRM device, but with no iris gallium driver the only GL left is
+# swrast/llvmpipe -> KWin falls back to software compositing (the flashing
+# white-box artifacts).
+#
+# Two jobs here:
+#   (a) materialize the iris_dri.so symlink when the megadriver is present but
+#       the symlink install was skipped (same class of fix as sections 14/31:
+#       the real driver file exists, only the <name>_dri.so link is missing);
+#   (b) if iris was genuinely NOT compiled (libgallium still carries the
+#       dri-target "iris: driver missing" stub) fail the merge LOUDLY, so a
+#       software-compositing ISO can never ship again.  build.sh's ensure_mesa()
+#       (called by merge and the standalone livefix step, BEFORE this script)
+#       wipes the stale _build and recompiles Mesa with iris; this gate is the
+#       back-stop that turns a silent regression into a hard build failure.
+say "== section 58: Mesa lib/dri completeness (Intel iris) =="
+MESA_IRIS_FAIL=0
+MESA_VER=$(basename "$(readlink "$TREE/Programs/Mesa/Current" 2>/dev/null || echo 25.3.6)")
+MESA_DRI="$TREE/Programs/Mesa/$MESA_VER/lib/dri"
+if [ -d "$MESA_DRI" ]; then
+    # The megadriver is the only regular *_dri.so here; every real driver is a
+    # symlink to it (iris_dri.so -> libdril_dri.so, radeonsi_dri.so -> ...).
+    mega=""
+    for f in "$MESA_DRI"/*_dri.so; do
+        [ -f "$f" ] && [ ! -L "$f" ] && mega="$(basename "$f")" && break
+    done
+    gallium=$(ls "$TREE/Programs/Mesa/$MESA_VER"/lib/libgallium-*.so 2>/dev/null | head -1)
+    # A driver that was NOT compiled leaves this exact stub string in libgallium.
+    iris_stub=0
+    if [ -n "$gallium" ] && command -v strings >/dev/null 2>&1 \
+       && strings -a "$gallium" 2>/dev/null | grep -qx 'iris: driver missing'; then
+        iris_stub=1
+    fi
+    if [ -e "$MESA_DRI/iris_dri.so" ] && [ "$iris_stub" = 0 ]; then
+        say "Mesa $MESA_VER: iris_dri.so present"
+    elif [ -n "$mega" ] && [ "$iris_stub" = 0 ]; then
+        ln -sf "$mega" "$MESA_DRI/iris_dri.so"
+        say "Mesa $MESA_VER: created missing iris_dri.so -> $mega"
+    else
+        say "FATAL: Mesa $MESA_VER has no compiled Intel iris driver (libgallium carries the 'iris: driver missing' stub)."
+        say "FATAL: the Intel iGPU would fall back to llvmpipe and KWin would composite in software (white-box glitches)."
+        say "FATAL: rebuild Mesa first -- run 'run-build.sh merge' (ensure_mesa wipes the stale meson _build and recompiles with iris)."
+        MESA_IRIS_FAIL=1
+    fi
+else
+    say "Mesa $MESA_VER: no lib/dri directory found (skipping iris completeness check)"
+fi
+if [ "$MESA_IRIS_FAIL" -ne 0 ]; then
+    say "!!! failing the livefix step: Mesa is missing the Intel iris driver."
+    exit 1
+fi
+
+# --- 59) xdg-open: Plasma 6 / kio-less fallback (fixes Electron OAuth) --------
+# xdg-utils 1.1.3's open_kde() only knows KDE_SESSION_VERSION 4 and 5. Under
+# Plasma 6 (KDE_SESSION_VERSION=6) its inner case matches NOTHING; a no-match
+# case returns 0, so the trailing `if [ $? -eq 0 ]` runs exit_success -- i.e.
+# xdg-open reports SUCCESS but launches NOTHING. Every shell.openExternal()
+# (Electron: Claude Desktop "Continue with Google", IDE links, ...) and any
+# other xdg-open caller therefore silently does nothing. Append an override of
+# open_kde() immediately before the DE dispatch so that, when no KDE opener
+# (kde-open4/5/6 or kfmclient) is installed, it falls back to open_generic ->
+# the xdg-mime default handler (firefox.desktop). Idempotent; guarded by sh -n.
+for xo in "$TREE"/Programs/XDG-Utils/*/bin/xdg-open; do
+    [ -f "$xo" ] || continue
+    if grep -q 'livefix: KDE6 xdg-open fallback' "$xo"; then
+        say "xdg-open already patched: ${xo#"${TREE%/}"/}"
+        continue
+    fi
+    REPL="$(mktemp)"
+    cat > "$REPL" <<'XDOEOF'
+# livefix: KDE6 xdg-open fallback -- see apply-live-fixes.sh section 59.
+# KDE6 ships no kde-open here and xdg-utils 1.1.3's open_kde() matched only
+# versions 4/5, so a no-match case returned 0 -> exit_success with no action.
+open_kde()
+{
+    case "${KDE_SESSION_VERSION}" in
+        4) command -v kde-open  >/dev/null 2>&1 && { kde-open  "$1" && exit_success; } ;;
+        5) command -v kde-open5 >/dev/null 2>&1 && { kde-open5 "$1" && exit_success; } ;;
+        6) command -v kde-open6 >/dev/null 2>&1 && { kde-open6 "$1" && exit_success; } ;;
+    esac
+    if command -v kfmclient >/dev/null 2>&1; then
+        kfmclient exec "$1"
+        kfmclient_fix_exit_code $?
+        [ $? -eq 0 ] && exit_success
+    fi
+    open_generic "$1"
+}
+XDOEOF
+    if awk -v repl="$REPL" '
+            !done && /^case "\$DE" in/ {
+                while ((getline l < repl) > 0) print l
+                close(repl); done = 1
+            }
+            { print }
+            END { exit(done ? 0 : 1) }
+        ' "$xo" > "$xo.livefix.tmp"; then
+        cat "$xo.livefix.tmp" > "$xo"
+        rm -f "$xo.livefix.tmp" "$REPL"
+        chmod 0755 "$xo"
+        if sh -n "$xo" 2>/dev/null; then
+            say "xdg-open patched (KDE6 + kio-less fallback): ${xo#"${TREE%/}"/}"
+        else
+            say "!!! FATAL: patched xdg-open fails syntax check: ${xo#"${TREE%/}"/}"
+            exit 1
+        fi
+    else
+        rm -f "$xo.livefix.tmp" "$REPL"
+        say "!!! FATAL: could not locate DE dispatch in ${xo#"${TREE%/}"/}"
+        exit 1
+    fi
+done
+
+# --- 60) frontier.ffxiv.com news/status: retrying TLS front --------------------
+# SE's frontier.ffxiv.com -- the ONLY host XIVLauncher uses for the in-launcher
+# news feed AND for the world/gate status -- is intermittently unreachable from
+# some networks: TCP + TLS complete in ~0.6 s but the HTTP response then hangs
+# (0 bytes) or comes back 502 Bad Gateway.  The launcher fetches each URL once
+# at startup and does not retry, so the panel shows "Could not Download news
+# data" and the status icon turns into the crossed-out "no connection" one (that
+# is the gate_status.json check on the same host).  This is SE-side (Goatcorp
+# FAQ: SE's Japan routing), so rather than chase it we front the host with a
+# local retrying proxy:
+#   * /etc/hosts pins frontier.ffxiv.com -> 127.0.0.1 (baked here, so it needs
+#     no runtime root/permission),
+#   * a tiny Python TLS terminator on 127.0.0.1:443 re-tries the upstream GET
+#     until it succeeds (and 5xx responses are retried too), re-resolving the
+#     real upstream IP by raw DNS (which bypasses the /etc/hosts pin), and
+#   * our CA is added to the system trust store so the client accepts the
+#     locally-terminated connection.
+# Wine's schannel is backed by GnuTLS, whose compiled trust path is exactly
+# /etc/ssl/certs/ca-certificates.crt (verified with `strings libgnutls.so`), and
+# that file is a hardlink of System/Settings/ssl/certs/ca-certificates.crt, so a
+# single append covers every consumer.  The CA private key is deleted after
+# signing: only the leaf key + cert ship, so the trust we bake can impersonate
+# frontier.ffxiv.com and nothing else.
+say "== section 60: frontier.ffxiv.com retrying TLS front =="
+FR_DIR="$TREE/System/Settings/frontier-retry"
+FR_HOST="frontier.ffxiv.com"
+FR_RDIR="/System/Settings/frontier-retry"   # runtime path (inside the booted ISO)
+FR_OPENSSL="$(command -v openssl 2>/dev/null || true)"
+[ -n "$FR_OPENSSL" ] || FR_OPENSSL="$(ls "$TREE"/Programs/OpenSSL/*/bin/openssl 2>/dev/null | head -1)"
+if [ -d "$TREE/System/Settings" ]; then
+    mkdir -p "$FR_DIR"
+
+    # (1) CA + leaf cert (generated once, then reused on every later merge).
+    # Openssl's built-in OPENSSLDIR here is /System/Settings/ssl, which may have
+    # no openssl.cnf in the merge context, so we pass an explicit minimal config
+    # (a bare `-config /dev/null` still fails: `req` wants distinguished_name).
+    if [ ! -s "$FR_DIR/frontier.crt" ] || [ ! -s "$FR_DIR/frontier.key" ] || [ ! -s "$FR_DIR/ca.crt" ]; then
+        if [ -n "$FR_OPENSSL" ] && [ -x "$FR_OPENSSL" ]; then
+            cat > "$FR_DIR/ca.cnf" <<'FR_CAEOF'
+[req]
+distinguished_name = dn
+prompt = no
+x509_extensions = v3_ca
+[dn]
+CN = GoboLiveCD Frontier Retry CA
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+FR_CAEOF
+            cat > "$FR_DIR/leaf.cnf" <<FR_LEAFEOF
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = $FR_HOST
+[v3_leaf]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:$FR_HOST
+FR_LEAFEOF
+            if ( cd "$FR_DIR" \
+                 && "$FR_OPENSSL" req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt \
+                        -days 3650 -config ca.cnf >/dev/null 2>&1 \
+                 && "$FR_OPENSSL" req -newkey rsa:2048 -nodes -keyout frontier.key -out frontier.csr \
+                        -config leaf.cnf >/dev/null 2>&1 \
+                 && "$FR_OPENSSL" x509 -req -in frontier.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+                        -out frontier.crt -days 3650 -extfile leaf.cnf -extensions v3_leaf >/dev/null 2>&1 ); then
+                rm -f "$FR_DIR/ca.key" "$FR_DIR/ca.srl" "$FR_DIR/frontier.csr"
+                say "frontier-retry: generated CA + leaf cert for $FR_HOST"
+            else
+                rm -f "$FR_DIR/ca.key" "$FR_DIR/ca.srl" "$FR_DIR/frontier.csr"
+                say "!!! frontier-retry: cert generation FAILED (openssl error)"
+            fi
+        else
+            say "!!! frontier-retry: openssl not found; cannot generate certs"
+        fi
+    else
+        say "frontier-retry: cert already present"
+    fi
+
+    # (2) trust the CA in the system bundle (hardlinked -> append once)
+    FR_BUNDLE="$TREE/etc/ssl/certs/ca-certificates.crt"
+    if [ -s "$FR_DIR/ca.crt" ] && [ -f "$FR_BUNDLE" ]; then
+        if ! grep -q 'GoboLiveCD Frontier Retry CA' "$FR_BUNDLE"; then
+            { printf '\n# GoboLiveCD Frontier Retry CA (livefix section 60)\n'; cat "$FR_DIR/ca.crt"; } >> "$FR_BUNDLE"
+            say "frontier-retry: CA appended to ca-certificates.crt"
+        fi
+        FR_HASH=""
+        [ -n "$FR_OPENSSL" ] && FR_HASH="$("$FR_OPENSSL" x509 -hash -noout -in "$FR_DIR/ca.crt" 2>/dev/null)"
+        for FR_CD in "$TREE/etc/ssl/certs" "$TREE/System/Settings/ssl/certs"; do
+            [ -d "$FR_CD" ] || continue
+            cp -f "$FR_DIR/ca.crt" "$FR_CD/frontier-retry-ca.pem"
+            [ -n "$FR_HASH" ] && ln -sf frontier-retry-ca.pem "$FR_CD/$FR_HASH.0"
+        done
+        say "frontier-retry: CA placed in certs dirs (hash ${FR_HASH:-?})"
+    fi
+
+    # (3) pin the hostname (baked; no runtime root or permission needed)
+    if [ -f "$TREE/etc/hosts" ] && ! grep -Eq "^[^#]*[[:space:]]$FR_HOST([[:space:]]|$)" "$TREE/etc/hosts"; then
+        printf '127.0.0.1\t%s\n' "$FR_HOST" >> "$TREE/etc/hosts"
+        say "frontier-retry: pinned $FR_HOST -> 127.0.0.1 in /etc/hosts"
+    fi
+
+    # (4) upstream IP (resolved on the build side; also refreshed at boot)
+    FR_IP="$(getent ahostsv4 "$FR_HOST" 2>/dev/null | awk 'NR==1{print $1}')"
+    [ -n "$FR_IP" ] || FR_IP="119.252.36.135"
+    cat > "$FR_DIR/frontier-retry.conf" <<EOF
+# livefix section 60: retrying TLS front for $FR_HOST
+# The upstream hostname is re-resolved at boot (System/Tasks/FrontierRetry)
+# because /etc/hosts pins it to 127.0.0.1; IP below is just the build-time seed.
+HOST=$FR_HOST
+IP=$FR_IP
+PORT=443
+MAX_ATTEMPTS=15
+ATTEMPT_TIMEOUT=8
+RETRY_DELAY=0.5
+CERT=$FR_RDIR/frontier.crt
+KEY=$FR_RDIR/frontier.key
+EOF
+    say "frontier-retry: upstream seed IP $FR_IP"
+
+    # (5) the proxy itself
+    cat > "$FR_DIR/frontier-retry.py" <<'FR_PYEOF'
+#!/usr/bin/env python3
+"""livefix section 60: retrying TLS front for frontier.ffxiv.com.
+
+Square Enix's frontier.ffxiv.com (the only host XIVLauncher uses for the news
+feed and for the world/gate status) intermittently hangs or 502s from some
+networks.  XIVLauncher fetches it once at startup and never retries, so the
+news panel stays empty.  This process terminates TLS locally (the hostname is
+pinned to 127.0.0.1 via /etc/hosts) and transparently retries the upstream
+request until it succeeds, then relays the response.
+"""
+import http.client
+import http.server
+import random
+import socket
+import ssl
+import struct
+import sys
+import time
+
+CONF = "/System/Settings/frontier-retry/frontier-retry.conf"
+LOG = "/Data/Variable/log/frontier-retry.log"
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+def load_conf():
+    cfg = {
+        "HOST": "frontier.ffxiv.com", "IP": "", "PORT": "443", "CNAME": "",
+        "CERT": "/System/Settings/frontier-retry/frontier.crt",
+        "KEY": "/System/Settings/frontier-retry/frontier.key",
+        "MAX_ATTEMPTS": "15", "ATTEMPT_TIMEOUT": "8", "RETRY_DELAY": "0.5",
+    }
+    try:
+        with open(CONF) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                cfg[key.strip()] = val.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+CFG = load_conf()
+HOST = CFG["HOST"]
+PORT = int(CFG["PORT"])
+UP_IP = CFG["IP"]
+SNI = CFG["CNAME"] or HOST
+MAX_ATTEMPTS = max(1, int(CFG["MAX_ATTEMPTS"]))
+ATTEMPT_TIMEOUT = float(CFG["ATTEMPT_TIMEOUT"])
+RETRY_DELAY = float(CFG["RETRY_DELAY"])
+
+
+def resolve_ip():
+    """Return HOST's first A record via a raw DNS query (bypasses /etc/hosts,
+    which pins HOST to 127.0.0.1)."""
+    for server in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
+        try:
+            tid = random.randint(0, 65535)
+            query = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+            for part in HOST.split("."):
+                query += bytes([len(part)]) + part.encode()
+            query += b"\x00" + struct.pack(">HH", 1, 1)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3)
+            sock.sendto(query, (server, 53))
+            data, _ = sock.recvfrom(4096)
+            sock.close()
+            if len(data) < 12:
+                continue
+            idx = 12
+            while idx < len(data) and data[idx] != 0:
+                idx += 1 + data[idx]
+            idx += 1 + 4
+            ancount = struct.unpack(">H", data[6:8])[0]
+            for _ in range(ancount):
+                if idx >= len(data):
+                    break
+                if data[idx] & 0xC0 == 0xC0:
+                    idx += 2
+                else:
+                    while data[idx] != 0:
+                        idx += 1 + data[idx]
+                    idx += 1
+                if idx + 10 > len(data):
+                    break
+                rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[idx:idx + 10])
+                idx += 10
+                if rtype == 1 and rdlen == 4 and idx + 4 <= len(data):
+                    return ".".join(str(b) for b in data[idx:idx + 4])
+                idx += rdlen
+        except OSError:
+            continue
+    return None
+
+
+class Upstream(http.client.HTTPSConnection):
+    """HTTPSConnection that dials an IP but validates against the real SNI.
+
+    The timeout is passed explicitly and re-applied to the wrapped socket:
+    HTTPSConnection defaults to a blocking socket, so omitting it would let a
+    hung upstream response block the relay forever.
+    """
+
+    def __init__(self, ip, port, sni, context, timeout):
+        self._sni = sni
+        super().__init__(ip, port, context=context, timeout=timeout)
+
+    def connect(self):
+        raw = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self._sni)
+        self.sock.settimeout(self.timeout)
+
+
+CLIENT_CTX = ssl.create_default_context()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _relay(self, method):
+        headers = []
+        for key, val in self.headers.items():
+            if key.lower() in ("connection", "proxy-connection", "keep-alive",
+                               "upgrade", "te", "transfer-encoding", "content-length"):
+                continue
+            headers.append((key, val))
+        body = b""
+        if self.headers.get("Content-Length"):
+            try:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+            except (ValueError, OSError):
+                body = b""
+
+        last = "no attempt"
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            conn = None
+            try:
+                conn = Upstream(UP_IP, PORT, SNI, CLIENT_CTX, ATTEMPT_TIMEOUT)
+                conn.request(method, self.path, body=body or None, headers=dict(headers))
+                resp = conn.getresponse()
+                data = resp.read()
+                status = resp.status
+                if 500 <= status < 600:
+                    last = "HTTP %d" % status
+                    log("attempt %d/%d %s %s -> %d, retrying" % (attempt, MAX_ATTEMPTS, method, self.path, status))
+                    time.sleep(RETRY_DELAY)
+                    continue
+                self.send_response(status)
+                for key, val in resp.getheaders():
+                    if key.lower() in ("connection", "keep-alive", "transfer-encoding",
+                                       "content-length", "upgrade"):
+                        continue
+                    self.send_header(key, val)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                if method != "HEAD":
+                    self.wfile.write(data)
+                log("attempt %d/%d %s %s -> %d (%d bytes)" % (attempt, MAX_ATTEMPTS, method, self.path, status, len(data)))
+                return
+            except Exception as exc:
+                last = repr(exc)
+                log("attempt %d/%d %s %s -> %r, retrying" % (attempt, MAX_ATTEMPTS, method, self.path, exc))
+                time.sleep(RETRY_DELAY)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        msg = ("502 Bad Gateway: upstream %s unreachable (%s)\n" % (HOST, last)).encode()
+        try:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(msg)
+        except Exception:
+            pass
+        log("GIVING UP %s %s after %d attempts (%s)" % (method, self.path, MAX_ATTEMPTS, last))
+
+    def do_GET(self):
+        self._relay("GET")
+
+    def do_HEAD(self):
+        self._relay("HEAD")
+
+    def do_POST(self):
+        self._relay("POST")
+
+    def do_OPTIONS(self):
+        self._relay("OPTIONS")
+
+
+def main():
+    global UP_IP
+    if not UP_IP or UP_IP == "127.0.0.1":
+        resolved = resolve_ip()
+        if resolved:
+            UP_IP = resolved
+            log("resolved %s -> %s" % (HOST, UP_IP))
+    if not UP_IP or UP_IP == "127.0.0.1":
+        log("FATAL: could not resolve upstream %s; refusing to start" % HOST)
+        sys.exit(1)
+
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        server_ctx.load_cert_chain(CFG["CERT"], CFG["KEY"])
+    except (OSError, ssl.SSLError) as exc:
+        log("FATAL: cannot load cert/key (%r)" % exc)
+        sys.exit(1)
+    try:
+        server_ctx.set_alpn_protocols(["http/1.1"])
+    except NotImplementedError:
+        pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    httpd.daemon_threads = True
+    httpd.socket = server_ctx.wrap_socket(httpd.socket, server_side=True)
+    log("listening on 127.0.0.1:%d -> %s (%s) sni=%s" % (PORT, UP_IP, HOST, SNI))
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+FR_PYEOF
+    chmod 0755 "$FR_DIR/frontier-retry.py"
+    say "frontier-retry: installed proxy script"
+
+    # (6) boot task: refresh the upstream IP, then launch the proxy as root
+    # (binding 127.0.0.1:443 requires root; StartLiveCD runs as root)
+    cat > "$TREE/System/Tasks/FrontierRetry" <<'FR_TASKEOF'
+#!/bin/sh
+# livefix section 60: retrying TLS front for frontier.ffxiv.com (SE news host).
+# Idempotent; runs as root at boot from StartLiveCD.
+case "$1" in
+[Ss]tart)
+    pgrep -f /System/Settings/frontier-retry/frontier-retry.py >/dev/null 2>&1 && exit 0
+    [ -f /System/Settings/frontier-retry/frontier-retry.py ] || exit 0
+    mkdir -p /Data/Variable/log
+    # Refresh the real upstream IP.  dig queries the resolver directly, so it
+    # bypasses the /etc/hosts 127.0.0.1 pin.
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short +time=3 +tries=1 @1.1.1.1 frontier.ffxiv.com A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        [ -z "$ip" ] && ip=$(dig +short +time=3 +tries=1 @8.8.8.8 frontier.ffxiv.com A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        if [ -n "$ip" ]; then
+            sed -i "s/^IP=.*/IP=$ip/" /System/Settings/frontier-retry/frontier-retry.conf 2>/dev/null || true
+        fi
+    fi
+    py=python3
+    command -v python3 >/dev/null 2>&1 || py=/System/Index/bin/python3
+    "$py" /System/Settings/frontier-retry/frontier-retry.py >>/Data/Variable/log/frontier-retry.log 2>&1 &
+    ;;
+[Ss]top)
+    pkill -f /System/Settings/frontier-retry/frontier-retry.py
+    ;;
+esac
+FR_TASKEOF
+    chmod 0755 "$TREE/System/Tasks/FrontierRetry"
+    say "frontier-retry: installed System/Tasks/FrontierRetry"
+
+    # (7) hook it into StartLiveCD right after the network is brought up
+    for FR_SLC in "$TREE"/Programs/LiveCD/*/bin/StartLiveCD; do
+        [ -f "$FR_SLC" ] || continue
+        if grep -q 'StartTask FrontierRetry' "$FR_SLC"; then
+            say "frontier-retry: StartLiveCD already hooked (${FR_SLC#"${TREE%/}"/})"
+            continue
+        fi
+        if awk '
+            { print }
+            !done && /^[[:space:]]*StartTask[[:space:]]+Network[[:space:]]*$/ {
+                print "msg \"Starting frontier news retry proxy\""
+                print "StartTask FrontierRetry"
+                done = 1
+            }
+            END { exit(done ? 0 : 1) }
+        ' "$FR_SLC" > "$FR_SLC.livefix.tmp"; then
+            cat "$FR_SLC.livefix.tmp" > "$FR_SLC"
+            rm -f "$FR_SLC.livefix.tmp"
+            chmod 0755 "$FR_SLC"
+            say "frontier-retry: hooked StartTask FrontierRetry into ${FR_SLC#"${TREE%/}"/}"
+        else
+            rm -f "$FR_SLC.livefix.tmp"
+            say "!!! frontier-retry: could not find 'StartTask Network' in ${FR_SLC#"${TREE%/}"/}"
+        fi
+    done
+fi
+
+# --- 57b) Ensure sudo is configured for live user (robust) ---------------------
+# Guarantee the live rule exists in all relevant sudoers files and that the
+# binary is setuid root. This runs before the final check to avoid false fails.
+LIVE_SUDO_RULE='live ALL=(ALL:ALL) NOPASSWD: ALL'
+if [ -d "$TREE/Programs/Sudo" ]; then
+    for sf_cand in \
+        "$TREE/etc/sudoers" \
+        "$TREE/System/Settings/sudoers" \
+        "$TREE/Programs/Sudo/Settings/sudoers" \
+        "$TREE/Programs/Sudo/Current/Settings/sudoers"; do
+        sf_real="$(tree_realpath "${sf_cand#/}")" 2>/dev/null || sf_real=""
+        [ -z "$sf_real" ] && sf_real="$(tree_realpath "$sf_cand")" 2>/dev/null || true
+        [ -f "$sf_real" ] || continue
+        if ! grep -Eq '^[[:space:]]*live[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL[[:space:]]*$' "$sf_real" 2>/dev/null; then
+            printf '\n# LiveCD user: root for GParted / Gobo GUI installer (no password prompt)\n%s\n' \
+                "$LIVE_SUDO_RULE" >> "$sf_real" 2>/dev/null && \
+                say "sudoers: appended live rule to ${sf_real#"${TREE%/}"/}"
+        fi
+        chown root:root "$sf_real" 2>/dev/null || true
+        chmod 0440 "$sf_real" 2>/dev/null || true
+    done
+    SUDO_DIR_FIX="$(progdir Sudo)"
+    if [ -n "$SUDO_DIR_FIX" ] && [ -f "$SUDO_DIR_FIX/bin/sudo" ]; then
+        chown root:root "$SUDO_DIR_FIX/bin/sudo" 2>/dev/null || true
+        chmod 4755 "$SUDO_DIR_FIX/bin/sudo" 2>/dev/null || true
+        say "setuid: sudo binary fixed to root:4755"
+    fi
+fi
+
+# --- live-sudo FINAL CHECK begin ----------------------------------------------
+# Kept at the very end so nothing above can silently undo it.  If live cannot
+# use sudo the image is bad, so say so loudly and fail the livefix step instead
+# of shipping an ISO that answers "live is not in the sudoers file".
+# (build.sh re-applies root ownership + setuid after its hand-back chown; that
+# block only knows Programs/Sudo/Settings/sudoers.)
+if [ -d "$TREE/Programs/Sudo" ]; then
+    say "== final check: can live use sudo?"
+    grep -q '^live:' "$TREE/etc/passwd" 2>/dev/null \
+        || { say "FAIL: no live user in etc/passwd"; LIVE_SUDO_FAIL=1; }
+    grep -qE '^live:\$' "$TREE/etc/shadow" 2>/dev/null \
+        || { say "FAIL: live has no usable password hash in etc/shadow (locked?)"; LIVE_SUDO_FAIL=1; }
+    if [ "${#SUDO_FILES[@]}" -eq 0 ]; then
+        say "FAIL: no sudoers file was configured"; LIVE_SUDO_FAIL=1
+    fi
+    for sf in ${SUDO_FILES[@]+"${SUDO_FILES[@]}"}; do
+        if ! grep -Eq '^[[:space:]]*live[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL[[:space:]]*$' "$sf"; then
+            say "FAIL: no NOPASSWD rule for live in ${sf#"${TREE%/}"/}"; LIVE_SUDO_FAIL=1
+        fi
+        if [ "$(stat -c '%u:%a' "$sf" 2>/dev/null)" != "0:440" ]; then
+            say "FAIL: ${sf#"${TREE%/}"/} must be root-owned mode 0440 (is $(stat -c '%U:%a' "$sf" 2>/dev/null))"
+            LIVE_SUDO_FAIL=1
+        fi
+    done
+    SUDO_BIN="$(tree_realpath /Programs/Sudo/Current/bin/sudo)"
+    if [ ! -f "$SUDO_BIN" ]; then
+        say "FAIL: sudo binary not found at /Programs/Sudo/Current/bin/sudo"; LIVE_SUDO_FAIL=1
+    elif [ ! -u "$SUDO_BIN" ] || [ "$(stat -c %u "$SUDO_BIN")" != "0" ]; then
+        say "FAIL: sudo binary must be setuid root (is $(stat -c '%U:%a' "$SUDO_BIN"))"; LIVE_SUDO_FAIL=1
+    fi
+    if [ ! -e "$TREE/etc/pam.d/sudo" ] && [ ! -L "$TREE/etc/pam.d/sudo" ]; then
+        say "FAIL: no etc/pam.d/sudo"; LIVE_SUDO_FAIL=1
+    fi
+    awk -F: '$1=="wheel"{print $4}' "$TREE/etc/group" 2>/dev/null | tr ',' '\n' | grep -qx live \
+        || { say "FAIL: live is not a member of the wheel group in etc/group"; LIVE_SUDO_FAIL=1; }
+    if [ "$LIVE_SUDO_FAIL" -ne 0 ]; then
+        say "!!! live will NOT be able to use sudo in this image - failing the livefix step."
+        exit 1
+    fi
+    say "final check OK: live has passwordless sudo (rule present, files root:0440, sudo setuid root, PAM service present)"
+fi
+# --- live-sudo FINAL CHECK end ------------------------------------------------
+
 say "== done with $TREE"
+gpu_manifest_summary
